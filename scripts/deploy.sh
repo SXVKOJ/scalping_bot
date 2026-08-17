@@ -147,47 +147,86 @@ install_docker() {
   ok "Docker установлен."
 }
 
-curl_telegram() {
-  local token="$1" proxy="$2" url
-  url="https://api.telegram.org/bot${token}/getMe"
-  if [[ -n "$proxy" ]]; then
-    curl -sS --max-time 25 -x "$proxy" "$url" || true
-  else
-    curl -sS --max-time 25 "$url" || true
-  fi
-}
-
-parse_getme() {
-  python3 - <<'PY'
-import json, sys
-raw = sys.stdin.read().strip()
-if not raw:
-    print("FAIL|||Пустой ответ от Telegram. Проверьте интернет или прокси.")
-    raise SystemExit(0)
-try:
-    data = json.loads(raw)
-except Exception:
-    print("FAIL|||Telegram вернул не JSON. Часто это блокировка без прокси.\n" + raw[:300])
-    raise SystemExit(0)
-if not data.get("ok"):
-    desc = data.get("description") or data.get("error_code") or raw[:200]
-    print(f"FAIL|||Токен не принят: {desc}")
-    raise SystemExit(0)
-r = data.get("result") or {}
-username = r.get("username") or ""
-name = r.get("first_name") or ""
-tid = r.get("id") or ""
-uname = f"@{username}" if username else "(без username)"
-print(f"OK|||{uname}|||{name}|||{tid}")
-PY
-}
-
+# На многих VPS AAAA-запись api.telegram.org есть, а IPv6 не маршрутизируется.
+# Старый curl без -4 зависал/отдавал пустоту — выглядело как «нет подключения».
 check_token() {
   local token="$1" proxy="$2"
-  local body parsed status
-  body="$(curl_telegram "$token" "$proxy")"
-  parsed="$(printf '%s' "$body" | parse_getme)"
-  printf '%s' "$parsed"
+  python3 - "$token" "$proxy" <<'PY'
+import json, socket, subprocess, sys, urllib.error, urllib.request
+
+token = sys.argv[1]
+proxy = (sys.argv[2] if len(sys.argv) > 2 else "").strip()
+url = f"https://api.telegram.org/bot{token}/getMe"
+errors = []
+
+_old_getaddrinfo = socket.getaddrinfo
+
+def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    infos = _old_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+    if infos:
+        return infos
+    return _old_getaddrinfo(host, port, family, type, proto, flags)
+
+
+def parse_ok(raw: str) -> str:
+    data = json.loads(raw)
+    if not data.get("ok"):
+        desc = data.get("description") or data.get("error_code") or raw[:200]
+        return f"FAIL|||Токен не принят: {desc}"
+    r = data.get("result") or {}
+    username = r.get("username") or ""
+    name = r.get("first_name") or ""
+    tid = r.get("id") or ""
+    uname = f"@{username}" if username else "(без username)"
+    return f"OK|||{uname}|||{name}|||{tid}"
+
+
+def try_urllib() -> str:
+    socket.getaddrinfo = ipv4_getaddrinfo
+    handlers = []
+    if proxy:
+        if proxy.startswith("socks"):
+            raise RuntimeError("SOCKS через urllib пропускаем, будет curl")
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(url, headers={"User-Agent": "scalping-bot-setup"})
+    with opener.open(req, timeout=20) as resp:
+        return parse_ok(resp.read().decode("utf-8", "replace"))
+
+
+def try_curl(force_ipv4: bool) -> str:
+    cmd = ["curl", "-sS", "--connect-timeout", "12", "--max-time", "25", "-A", "scalping-bot-setup"]
+    if force_ipv4:
+        cmd.append("-4")
+    if proxy:
+        cmd.extend(["-x", proxy])
+    cmd.append(url)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    raw = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if raw:
+        try:
+            return parse_ok(raw)
+        except Exception as e:
+            return f"FAIL|||Непонятный ответ Telegram: {e}; {raw[:200]}"
+    extra = err or f"код curl {proc.returncode}"
+    raise RuntimeError(extra)
+
+
+for label, fn in (
+    ("python/IPv4", try_urllib),
+    ("curl/IPv4", lambda: try_curl(True)),
+    ("curl", lambda: try_curl(False)),
+):
+    try:
+        result = fn()
+        print(result)
+        raise SystemExit(0)
+    except Exception as e:
+        errors.append(f"{label}: {e}")
+
+print("FAIL|||Нет связи с api.telegram.org. " + " | ".join(errors))
+PY
 }
 
 ask_token() {
@@ -310,13 +349,11 @@ if [[ "$(ask_yes_no "Нужен прокси для Telegram?" "n")" == "y" ]]; 
     PROXY="$(ask_required "Вставьте строку прокси")"
     PROXY="$(printf '%s' "$PROXY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     echo "Проверяю прокси на api.telegram.org ..." >/dev/tty
-    if curl -sS --max-time 20 -x "$PROXY" -o /dev/null -w '' "https://api.telegram.org" 2>/dev/null \
-      || curl -sS --max-time 20 -x "$PROXY" "https://api.telegram.org/bot123:AAA/getMe" 2>/dev/null | grep -q 'Unauthorized\|ok'; then
+    if curl -4 -sS --connect-timeout 12 --max-time 20 -x "$PROXY" "https://api.telegram.org/bot123:AAA/getMe" 2>/dev/null | grep -q 'Unauthorized\|ok'; then
       ok "Прокси отвечает, Telegram доступен."
       break
     fi
-    # Unauthorized 401 still means Telegram API is reachable
-    code="$(curl -sS --max-time 20 -x "$PROXY" -o /tmp/tg_proxy_check.json -w '%{http_code}' "https://api.telegram.org/bot123:AAA/getMe" || true)"
+    code="$(curl -4 -sS --connect-timeout 12 --max-time 20 -x "$PROXY" -o /tmp/tg_proxy_check.json -w '%{http_code}' "https://api.telegram.org/bot123:AAA/getMe" || true)"
     if [[ "$code" == "401" || "$code" == "200" ]]; then
       ok "Прокси отвечает, Telegram доступен."
       break
