@@ -26,12 +26,10 @@ class AccessMiddleware(BaseMiddleware):
 
             telegram_user = message.from_user
 
-            # Пропускаем базовые команды без проверки подписки
-            if message.text and any(message.text.startswith(cmd) for cmd in ALLOWED_COMMANDS):
-                return await handler(event, data)
-
             try:
-                # Добавление юзера, если нет (по telegram_id; pair задаем через defaults)
+                # Пара берётся из PAIR в .env этого экземпляра.
+                # Уже существующим пользователям её тоже обновляем — иначе
+                # после смены конфига в БД остаётся старое значение (BTC/USDT).
                 user, _ = await User.objects.aget_or_create(
                     telegram_id=telegram_user.id,
                     defaults={
@@ -39,9 +37,19 @@ class AccessMiddleware(BaseMiddleware):
                         "pair": PAIR,
                     },
                 )
+                if PAIR and user.pair != PAIR:
+                    logger.info(
+                        f"Updating user {telegram_user.id} pair {user.pair!r} -> {PAIR!r}"
+                    )
+                    user.pair = PAIR
+                    await user.asave(update_fields=["pair"])
             except Exception as e:
                 logger.error(f"DB error while checking/creating user: {e}")
                 return  # Лучше блокировать, чем продолжать с ошибкой
+
+            # Пропускаем базовые команды без проверки подписки
+            if message.text and any(message.text.startswith(cmd) for cmd in ALLOWED_COMMANDS):
+                return await handler(event, data)
 
             # Проверка подписки
             now = datetime.now(timezone.utc)

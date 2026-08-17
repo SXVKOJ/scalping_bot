@@ -12,7 +12,7 @@ from bot.logger import logger
 from bot.utils.error_notifier import notify_user_command_error
 from bot.keyboards.inline import get_period_keyboard, get_pagination_keyboard
 from asgiref.sync import sync_to_async
-from bot.utils.mexc_rest import MexcRestClient
+from bot.utils.mexc_rest import MexcRestClient, split_pair, to_mexc_symbol
 from django.utils.timezone import localtime
 from bot.utils.mexc import handle_mexc_response
 from bot.utils.api_errors import parse_mexc_error
@@ -45,12 +45,14 @@ async def get_user_price(message: Message):
         if not pair:
             raise ValueError("Валютная пара не указана.")
 
+        symbol = to_mexc_symbol(pair)
+
         # Сначала получаем текущую цену с помощью REST API
         # Тикер публичный — используем REST напрямую
         api_key = user.api_key or ""
         api_secret = user.api_secret or ""
         rest = MexcRestClient(api_key=api_key, api_secret=api_secret)
-        ticker = await asyncio.wait_for(rest.ticker_price(pair), timeout=10)
+        ticker = await asyncio.wait_for(rest.ticker_price(symbol), timeout=10)
         current_price = ticker["price"]
 
         # Формируем начальный ответ
@@ -59,24 +61,24 @@ async def get_user_price(message: Message):
 
         # Создаём или подключаемся к WebSocket для рыночных данных
         if not websocket_manager.market_connection:
-            await websocket_manager.connect_market_data([pair])
-        elif pair not in websocket_manager.market_subscriptions:
-            await websocket_manager.subscribe_market_data([pair])
+            await websocket_manager.connect_market_data([symbol])
+        elif symbol not in websocket_manager.market_subscriptions:
+            await websocket_manager.subscribe_market_data([symbol])
 
         # Функция для обновления цены в сообщении
-        async def update_price_message(symbol, price):
+        async def update_price_message(ws_symbol, price):
             nonlocal sent_message
-            await sent_message.edit_text(f"Цена {symbol}: {price} (обновлено)")
+            await sent_message.edit_text(f"Цена {pair}: {price} (обновлено)")
 
         # Регистрируем callback для обновления цены в реальном времени
-        await websocket_manager.register_price_callback(pair, update_price_message)
+        await websocket_manager.register_price_callback(symbol, update_price_message)
 
         # Через 10 секунд удалим callback (чтобы не накапливать их)
         await asyncio.sleep(10)
 
-        if pair in websocket_manager.price_callbacks:
-            if update_price_message in websocket_manager.price_callbacks[pair]:
-                websocket_manager.price_callbacks[pair].remove(update_price_message)
+        if symbol in websocket_manager.price_callbacks:
+            if update_price_message in websocket_manager.price_callbacks[symbol]:
+                websocket_manager.price_callbacks[symbol].remove(update_price_message)
 
     except ValueError as e:
         # Обрабатываем ошибки, если ошибка в API или данных
@@ -126,11 +128,17 @@ async def balance_handler(message: Message):
         logger.info("/balance: user fetched, reading pair/keys...")
         pair = user.pair
         extra_data["pair"] = pair
+        if not pair:
+            response_text = "❗ Вы не выбрали торговую пару. Введите /pair для выбора."
+            success = False
+            await message.answer(response_text)
+            raise ValueError("Missing pair")
         if not user.api_key or not user.api_secret:
             response_text = "❗ Не настроены API ключи. Укажите их в настройках."
             success = False
             await message.answer(response_text)
             raise ValueError("Missing API keys")
+        symbol = to_mexc_symbol(pair)
         rest = MexcRestClient(api_key=user.api_key, api_secret=user.api_secret)
 
         logger.info("/balance: fetching account_info...")
@@ -143,8 +151,7 @@ async def balance_handler(message: Message):
         logger.info(f"Account Info for {message.from_user.id}: {account_info}")
 
         # Определим интересующие нас токены на основе пары
-        base_asset = pair[:-4]  # например, KAS или BTC
-        quote_asset = pair[-4:]  # например, USDT или USDC
+        base_asset, quote_asset = split_pair(pair)
         relevant_assets = {base_asset, quote_asset}
 
         balances_message = "💰 <b>БАЛАНС</b>\n"
@@ -163,8 +170,8 @@ async def balance_handler(message: Message):
                 f"Заморожено: {format(locked, ',.6f').replace(',', 'X').replace('.', ',').replace('X', '.').replace(' ', ' ')}"
             )
 
-        logger.info("/balance: fetching open_orders...")
-        orders_task = asyncio.create_task(rest.open_orders(symbol=pair))
+        logger.info(f"/balance: fetching open_orders for {symbol}...")
+        orders_task = asyncio.create_task(rest.open_orders(symbol=symbol))
         try:
             orders = await asyncio.wait_for(orders_task, timeout=20)
         except asyncio.TimeoutError:

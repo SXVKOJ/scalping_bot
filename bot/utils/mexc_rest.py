@@ -6,6 +6,28 @@ import time
 from typing import Dict, Any, Optional
 from urllib.parse import urlencode, quote
 
+# PAIR in .env / DB is stored as BTC/USDT; MEXC REST/WS need BTCUSDT.
+_QUOTE_ASSETS = ("USDT", "USDC", "BUSD", "USD")
+
+
+def to_mexc_symbol(pair: str) -> str:
+    return (pair or "").replace("/", "").replace("-", "").replace("_", "").upper().strip()
+
+
+def split_pair(pair: str) -> tuple:
+    raw = (pair or "").strip().upper()
+    if "/" in raw:
+        base, quote = raw.split("/", 1)
+        return base.strip(), quote.strip()
+    if "-" in raw:
+        base, quote = raw.split("-", 1)
+        return base.strip(), quote.strip()
+    symbol = to_mexc_symbol(raw)
+    for quote in _QUOTE_ASSETS:
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return symbol[: -len(quote)], quote
+    return symbol[:-4], symbol[-4:]
+
 
 class MexcRestClient:
     """Minimal MEXC Spot v3 REST client (async), signed endpoints included."""
@@ -162,6 +184,7 @@ class MexcRestClient:
 
     # Public
     async def ticker_price(self, symbol: str) -> Dict[str, Any]:
+        symbol = to_mexc_symbol(symbol)
         return await self._request(
             "GET",
             "/api/v3/ticker/price",
@@ -177,6 +200,7 @@ class MexcRestClient:
         )
 
     async def open_orders(self, symbol: str) -> Any:
+        symbol = to_mexc_symbol(symbol)
         return await self._request(
             "GET", "/api/v3/openOrders", {"symbol": symbol}, signed=True, timeout_sec=20
         )
@@ -184,14 +208,14 @@ class MexcRestClient:
     async def new_order(
         self, symbol: str, side: str, order_type: str, options: Dict[str, Any]
     ) -> Dict[str, Any]:
-        params = {"symbol": symbol, "side": side, "type": order_type}
+        params = {"symbol": to_mexc_symbol(symbol), "side": side, "type": order_type}
         params.update(options or {})
         return await self._request(
             "POST", "/api/v3/order", params, signed=True, timeout_sec=25
         )
 
     async def query_order(self, symbol: str, options: Dict[str, Any]) -> Dict[str, Any]:
-        params = {"symbol": symbol}
+        params = {"symbol": to_mexc_symbol(symbol)}
         params.update(options or {})
         return await self._request(
             "GET", "/api/v3/order", params, signed=True, timeout_sec=20

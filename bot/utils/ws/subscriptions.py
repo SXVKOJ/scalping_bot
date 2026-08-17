@@ -3,10 +3,12 @@ import time
 from typing import List
 
 from bot.logger import logger
+from bot.utils.mexc_rest import to_mexc_symbol
 
 
 async def subscribe_market_data(manager, symbols: List[str]) -> bool:
     """Subscribe to market data for specific symbols."""
+    symbols = [to_mexc_symbol(s) for s in symbols]
     if not manager.market_connection:
         logger.error("Market connection not established - cannot subscribe to market data")
         logger.debug(f"Attempted to subscribe to symbols: {symbols}")
@@ -15,7 +17,7 @@ async def subscribe_market_data(manager, symbols: List[str]) -> bool:
     try:
         ws = manager.market_connection['ws']
 
-        params = [f"spot@public.aggre.deals.v3.api.pb@100ms@{symbol.upper()}" for symbol in symbols]
+        params = [f"spot@public.aggre.deals.v3.api.pb@100ms@{symbol}" for symbol in symbols]
 
         subscription_msg = {
             "method": "SUBSCRIPTION",
@@ -36,6 +38,7 @@ async def subscribe_market_data(manager, symbols: List[str]) -> bool:
 
 async def subscribe_bookticker_data(manager, symbols: List[str]) -> bool:
     """Subscribe to bookTicker data for specific symbols to get best bid/ask prices."""
+    symbols = [to_mexc_symbol(s) for s in symbols]
     if not manager.market_connection:
         logger.error("Market connection not established for bookTicker subscription")
         return False
@@ -43,7 +46,7 @@ async def subscribe_bookticker_data(manager, symbols: List[str]) -> bool:
     try:
         ws = manager.market_connection['ws']
 
-        params = [f"spot@public.aggre.bookTicker.v3.api.pb@100ms@{symbol.upper()}" for symbol in symbols]
+        params = [f"spot@public.aggre.bookTicker.v3.api.pb@100ms@{symbol}" for symbol in symbols]
 
         subscription_msg = {
             "method": "SUBSCRIPTION",

@@ -102,7 +102,15 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_TOKEN')
-PAIR = os.getenv('PAIR')
+
+
+def _clean_pair(raw):
+    if not raw:
+        return raw
+    return raw.strip().strip('"').strip("'").replace("\r", "").strip()
+
+
+PAIR = _clean_pair(os.getenv('PAIR'))
 TELEGRAM_PROXY = (os.getenv('TELEGRAM_PROXY') or os.getenv('HTTPS_PROXY') or os.getenv('HTTP_PROXY') or '').strip()
 NOTIFICATION_CHAT_ID = os.getenv('NOTIFICATION_CHAT_ID')
 NOTIFICATION_CHAT_IDS = os.getenv('NOTIFICATION_CHAT_IDS')
