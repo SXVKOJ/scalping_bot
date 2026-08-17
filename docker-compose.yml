@@ -1,0 +1,73 @@
+services:
+  scalpingdb:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PUBLISH_BIND:-127.0.0.1}:${POSTGRES_PUBLISH_PORT:-5432}:5432"
+    networks:
+      - scalping_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  scalpingweb:
+    build: .
+    entrypoint: ["python", "scripts/entrypoint.py"]
+    command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    volumes:
+      - .:/app
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    env_file:
+      - ${BOT_ENV_FILE:-.env}
+    depends_on:
+      scalpingdb:
+        condition: service_healthy
+    networks:
+      - scalping_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  scalpingbot:
+    build: .
+    entrypoint: ["python", "scripts/entrypoint.py"]
+    command: ["python", "bot/tg_bot.py"]
+    volumes:
+      - .:/app
+    env_file:
+      - ${BOT_ENV_FILE:-.env}
+    depends_on:
+      scalpingdb:
+        condition: service_healthy
+    networks:
+      - scalping_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "30m"
+        max-file: "3"
+
+networks:
+  scalping_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
