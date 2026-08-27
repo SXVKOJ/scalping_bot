@@ -24,6 +24,33 @@ autobuy_states = {}  # {user_id: {'last_buy_price': float, 'active_orders': [], 
 trigger_states = {}  # {user_id: {'trigger_price': float, 'trigger_time': float, 'is_rise_trigger': bool}}
 
 
+def get_rest_client(telegram_id: int, user: User) -> MexcRestClient:
+    """Возвращает переиспользуемый REST-клиент с keep-alive сессией.
+
+    Клиент создаётся один раз на пользователя и хранится в autobuy_states,
+    чтобы каждый ордер не открывал новое TCP/TLS-соединение к MEXC.
+    Пересоздаётся только если сменился API-ключ.
+    """
+    state = autobuy_states.get(telegram_id)
+    if state is None:
+        return MexcRestClient(api_key=user.api_key, api_secret=user.api_secret)
+    client = state.get("rest_client")
+    if client is None or getattr(client, "api_key", None) != user.api_key:
+        client = MexcRestClient(api_key=user.api_key, api_secret=user.api_secret)
+        state["rest_client"] = client
+    return client
+
+
+async def _safe_send(telegram_id: int, text: str):
+    """Отправка уведомления, не влияющая на скорость покупки (fire-and-forget)."""
+    try:
+        from bot.config import bot_instance
+
+        await bot_instance.send_message(telegram_id, text)
+    except Exception as e:
+        logger.error(f"Failed to send notification to {telegram_id}: {e}")
+
+
 async def autobuy_loop(message: Message, telegram_id: int):
     startup_fail_count = 0
 
@@ -73,7 +100,21 @@ async def autobuy_loop(message: Message, telegram_id: int):
                     "last_mid_price": None,  # Последняя mid цена для анализа тренда
                     "buy_in_progress": False,  # Глобальный флаг покупки
                     "buy_lock": asyncio.Lock(),  # Глобальная блокировка покупки на пользователя
+                    "cached_loss": None,  # Кеш настройки "падение" (%), обновляется в фоне
+                    "cached_profit": None,  # Кеш настройки "профит" (%)
+                    "cached_pause": 0,  # Кеш настройки "пауза" (сек)
+                    "autobuy_active": True,  # Кеш флага автобая (без запроса в БД на тике)
+                    "rest_client": None,  # Переиспользуемый REST-клиент (keep-alive)
                 }
+
+            # Кешируем настройки в память, чтобы hot-path (обработчик тиков)
+            # не ходил в БД на каждом обновлении цены. Кеш обновляется в
+            # основном цикле (10с) и в periodic_resource_check (60с).
+            autobuy_states[telegram_id]["cached_loss"] = float(user.loss)
+            autobuy_states[telegram_id]["cached_profit"] = float(user.profit)
+            autobuy_states[telegram_id]["cached_pause"] = user.pause
+            autobuy_states[telegram_id]["autobuy_active"] = True
+            autobuy_states[telegram_id]["rest_client"] = rest
 
             # Восстанавливаем активные ордера из БД
             deals_qs = Deal.objects.filter(
@@ -123,13 +164,9 @@ async def autobuy_loop(message: Message, telegram_id: int):
                 symbol_name, bid_price, ask_price, bid_qty, ask_qty
             ):
                 try:
-                    # Проверяем, что пользователь все еще в режиме автобай
-                    user_data = await sync_to_async(
-                        User.objects.filter(
-                            telegram_id=telegram_id, autobuy=True
-                        ).exists
-                    )()
-                    if not user_data:
+                    # Быстрая проверка по кешу в памяти — без запроса в БД на каждый тик
+                    state = autobuy_states.get(telegram_id)
+                    if not state or not state.get("autobuy_active"):
                         return
 
                     # Получаем информацию о направлении цены
@@ -138,19 +175,15 @@ async def autobuy_loop(message: Message, telegram_id: int):
                     current_time = time.time()
                     mid_price = (float(bid_price) + float(ask_price)) / 2
 
-                    # Получаем актуальные настройки пользователя
-                    user_settings = await sync_to_async(User.objects.get)(
-                        telegram_id=telegram_id
-                    )
-                    loss_threshold = float(user_settings.loss)
-                    profit_percent = float(user_settings.profit)
-                    pause_seconds = user_settings.pause
+                    # Настройки берём из кеша в памяти (обновляются в фоновых циклах),
+                    # чтобы не ходить в БД на каждом тике bookTicker
+                    loss_threshold = state.get("cached_loss")
+                    pause_seconds = state.get("cached_pause", 0)
+                    if loss_threshold is None:
+                        return
 
                     # Обновляем текущую цену
                     autobuy_states[telegram_id]["current_price"] = mid_price
-
-                    # Логируем обновление bookTicker
-                    # logger.info(f"BookTicker update for {telegram_id} ({symbol_name}): bid={bid_price}, ask={ask_price}, mid={mid_price:.6f}, is_rise={is_rise}")
 
                     # Проверяем триггеры для покупок на росте
                     await check_rise_triggers(
@@ -160,7 +193,7 @@ async def autobuy_loop(message: Message, telegram_id: int):
                         float(ask_price),
                         is_rise,
                         current_time,
-                        user_settings,
+                        pause_seconds,
                     )
 
                     # Проверяем условия для покупок на падении (используем ask цену)
@@ -183,50 +216,45 @@ async def autobuy_loop(message: Message, telegram_id: int):
                             autobuy_states[telegram_id]["last_drop_notification"] = (
                                 current_time
                             )
-                            logger.info(
-                                f"Price drop condition met for {telegram_id}: ask={ask_price:.6f}, last_buy={last_buy_price:.6f}, drop={price_drop_percent:.2f}% >= {loss_threshold:.2f}%"
-                            )
 
-                            # Send notification using bot instance directly
-                            from bot.config import bot_instance
-
-                            try:
-                                await bot_instance.send_message(
-                                    telegram_id,
-                                    f"🔻 Обнаружено падение цены для {symbol_name}\n\n"
-                                    f"🔻 Цена ({ask_price:.6f} USDC) снизилась на {price_drop_percent:.2f}% от покупки по {last_buy_price:.6f} USDC. \n"
-                                    f"Покупаем по условию падения ({loss_threshold:.2f}%).",
-                                )
-                                logger.info(f"Drop notification sent to {telegram_id}")
-                            except Exception as e:
-                                logger.error(
-                                    f"Failed to send drop notification to {telegram_id}: {e}"
-                                )
-
-                            # Перед запуском покупки проверяем очередь в памяти и в БД, а также флаг покупки
-                            state = autobuy_states.get(telegram_id, {})
+                            # Защита от параллельных покупок — проверяем ДО запуска
                             if state.get("buy_in_progress"):
                                 logger.info(
                                     f"Skip price_drop buy: buy_in_progress for {telegram_id}"
                                 )
                                 return
 
-                            # Create a fake message object for process_buy
+                            # СНАЧАЛА запускаем покупку (критично по времени).
+                            # Уведомление в Telegram отправляем отдельной задачей,
+                            # чтобы задержка API Telegram не тормозила ордер.
+                            trigger_ts = time.perf_counter()
                             from bot.utils.autobuy_restart import FakeMessage
                             from bot.config import bot_instance
 
                             fake_message = FakeMessage(telegram_id, bot_instance)
                             logger.info(
-                                f"Starting process_buy for {telegram_id} due to price drop"
+                                f"Price drop condition met for {telegram_id}: ask={ask_price:.6f}, "
+                                f"last_buy={last_buy_price:.6f}, drop={price_drop_percent:.2f}% "
+                                f">= {loss_threshold:.2f}%. Starting process_buy."
                             )
                             asyncio.create_task(
                                 process_buy(
                                     telegram_id,
                                     "price_drop",
                                     fake_message,
-                                    user_settings,
+                                    None,
+                                    trigger_ts,
                                 )
                             )
+
+                            # Уведомление о падении — не блокирует ордер
+                            drop_text = (
+                                f"🔻 Обнаружено падение цены для {symbol_name}\n\n"
+                                f"🔻 Цена ({ask_price:.6f} USDC) снизилась на {price_drop_percent:.2f}% "
+                                f"от покупки по {last_buy_price:.6f} USDC. \n"
+                                f"Покупаем по условию падения ({loss_threshold:.2f}%)."
+                            )
+                            asyncio.create_task(_safe_send(telegram_id, drop_text))
 
                 except Exception as e:
                     logger.error(
@@ -276,6 +304,23 @@ async def autobuy_loop(message: Message, telegram_id: int):
 
             # Ждем завершения автобая или отмены задачи
             while True:
+                # Обновляем кеш настроек из БД (~раз в 10с), чтобы hot-path
+                # (обработчик тиков) не делал запросов в БД на каждом тике.
+                try:
+                    fresh = await sync_to_async(User.objects.get)(
+                        telegram_id=telegram_id
+                    )
+                    st = autobuy_states.get(telegram_id)
+                    if st is not None:
+                        st["cached_loss"] = float(fresh.loss)
+                        st["cached_profit"] = float(fresh.profit)
+                        st["cached_pause"] = fresh.pause
+                        st["autobuy_active"] = bool(fresh.autobuy)
+                except Exception as e:
+                    logger.error(
+                        f"Не удалось обновить кеш настроек для {telegram_id}: {e}"
+                    )
+
                 # Проверка подписки
                 subscription = await sync_to_async(
                     Subscription.objects.filter(user=user).order_by("-expires_at").first
@@ -386,6 +431,14 @@ async def autobuy_loop(message: Message, telegram_id: int):
                             f"Ошибка при очистке bookTicker колбэков для {telegram_id}: {e}"
                         )
 
+            # Закрываем переиспользуемую REST-сессию (keep-alive)
+            rest_client = autobuy_states.get(telegram_id, {}).get("rest_client")
+            if rest_client:
+                try:
+                    await rest_client.close()
+                except Exception as e:
+                    logger.error(f"Ошибка при закрытии REST-сессии: {e}")
+
             # Если есть сессия, закрываем её
             if session:
                 try:
@@ -463,6 +516,16 @@ async def autobuy_loop(message: Message, telegram_id: int):
                                 f"Ошибка при очистке bookTicker колбэков: {cleanup_error}"
                             )
 
+                    # Закрываем переиспользуемую REST-сессию (keep-alive)
+                    rest_client = autobuy_states[telegram_id].get("rest_client")
+                    if rest_client:
+                        try:
+                            await rest_client.close()
+                        except Exception as cleanup_error:
+                            logger.error(
+                                f"Ошибка при закрытии REST-сессии: {cleanup_error}"
+                            )
+
                     del autobuy_states[telegram_id]
 
                 # Если есть сессия, закрываем её
@@ -501,7 +564,13 @@ async def autobuy_loop(message: Message, telegram_id: int):
             )
 
 
-async def process_buy(telegram_id: int, reason: str, message: Message, user: User):
+async def process_buy(
+    telegram_id: int,
+    reason: str,
+    message: Message,
+    user: User,
+    trigger_ts: float = None,
+):
     """Обработка покупки с защитой от одновременных операций"""
     # Импортируем здесь для избежания циклических импортов
     from bot.utils.websocket_manager import websocket_manager
@@ -561,7 +630,7 @@ async def process_buy(telegram_id: int, reason: str, message: Message, user: Use
                 current_price = autobuy_states[telegram_id].get("current_price", 0)
                 # await message.answer(f"🔄 Возобновляем автобай для {symbol} после паузы. Текущая цена: {current_price:.6f} {symbol[3:]}")
 
-            rest = MexcRestClient(api_key=user.api_key, api_secret=user.api_secret)
+            rest = get_rest_client(telegram_id, user)
             symbol = user.pair.replace("/", "")
             buy_amount = float(user.buy_amount)
             profit_percent = float(user.profit)
@@ -576,6 +645,14 @@ async def process_buy(telegram_id: int, reason: str, message: Message, user: Use
             )
             handle_mexc_response(buy_order, "Покупка")
             order_id = buy_order["orderId"]
+
+            # Замер задержки: от срабатывания сигнала до исполнения BUY на бирже
+            if trigger_ts is not None:
+                latency_ms = (time.perf_counter() - trigger_ts) * 1000
+                logger.info(
+                    f"[Latency] {telegram_id} {reason}: сигнал → исполнение BUY "
+                    f"{latency_ms:.0f} мс"
+                )
 
             # Подтягиваем детали ордера
             order_info = await rest.query_order(symbol, {"orderId": order_id})
@@ -825,7 +902,7 @@ async def check_rise_triggers(
     ask_price: float,
     is_rise: bool,
     current_time: float,
-    user_settings: User,
+    pause_seconds: int,
 ):
     """
     Проверяет триггеры для покупок на росте цены с правильным анализом тренда.
@@ -846,7 +923,6 @@ async def check_rise_triggers(
         ask_price_float = float(ask_price)
         bid_price_float = float(bid_price)
         mid_price = (bid_price_float + ask_price_float) / 2
-        pause_seconds = user_settings.pause
 
         # Инициализация и сохранение предыдущих цен
         prev_ask_price = state.get("last_ask_price")
@@ -947,7 +1023,7 @@ async def check_rise_triggers(
                         fake_message = FakeMessage(telegram_id, bot_instance)
                         asyncio.create_task(
                             process_buy(
-                                telegram_id, "rise_trigger", fake_message, user_settings
+                                telegram_id, "rise_trigger", fake_message, None
                             )
                         )
 
@@ -1167,6 +1243,14 @@ async def periodic_resource_check(telegram_id: int):
             # Проверяем соединение с WebSocket и восстанавливаем при необходимости
             user = await sync_to_async(User.objects.get)(telegram_id=telegram_id)
             symbol = user.pair.replace("/", "")
+
+            # Дублируем обновление кеша настроек (страховка, если основной цикл занят)
+            st = autobuy_states.get(telegram_id)
+            if st is not None:
+                st["cached_loss"] = float(user.loss)
+                st["cached_profit"] = float(user.profit)
+                st["cached_pause"] = user.pause
+                st["autobuy_active"] = bool(user.autobuy)
 
             if not websocket_manager.market_connection:
                 logger.warning(

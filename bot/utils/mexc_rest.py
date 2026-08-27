@@ -9,6 +9,43 @@ from urllib.parse import urlencode, quote
 # PAIR in .env / DB is stored as BTC/USDT; MEXC REST/WS need BTCUSDT.
 _QUOTE_ASSETS = ("USDT", "USDC", "BUSD", "USD")
 
+# Одна общая keep-alive сессия на весь процесс. Соединение к MEXC остаётся
+# открытым между запросами, поэтому market BUY не платит за новый TCP+TLS
+# handshake на каждом ордере (критично для скорости на скальпинге).
+# Авторизация задаётся заголовками per-request, поэтому сессию безопасно
+# делить между пользователями и ключами — общий пул только на транспорт.
+_shared_session: Optional["aiohttp.ClientSession"] = None
+_session_lock = asyncio.Lock()
+
+
+async def get_shared_session() -> aiohttp.ClientSession:
+    """Лениво создаёт и переиспользует одну keep-alive сессию на процесс."""
+    global _shared_session
+    if _shared_session is None or _shared_session.closed:
+        async with _session_lock:
+            if _shared_session is None or _shared_session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=100,
+                    limit_per_host=20,
+                    ttl_dns_cache=300,
+                    keepalive_timeout=60,
+                    enable_cleanup_closed=True,
+                )
+                _shared_session = aiohttp.ClientSession(connector=connector)
+    return _shared_session
+
+
+async def close_shared_session() -> None:
+    """Закрывает общую сессию (вызывать только при остановке процесса)."""
+    global _shared_session
+    if _shared_session is not None and not _shared_session.closed:
+        try:
+            await _shared_session.close()
+        except Exception:
+            pass
+    _shared_session = None
+
+
 
 def to_mexc_symbol(pair: str) -> str:
     return (pair or "").replace("/", "").replace("-", "").replace("_", "").upper().strip()
@@ -41,13 +78,25 @@ class MexcRestClient:
         self._last_time_sync: float = 0.0
         self._time_sync_interval_sec: int = 300
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Возвращает общую keep-alive сессию процесса."""
+        return await get_shared_session()
+
+    async def close(self) -> None:
+        """No-op: транспортная сессия общая для процесса и не закрывается
+        при остановке автобая одного пользователя. Метод оставлен для
+        совместимости с местами, которые вызывают client.close()."""
+        return None
+
     async def _server_time(self) -> int:
-        timeout = aiohttp.ClientTimeout(total=10)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(f"{self.BASE_URL}/api/v3/time") as resp:
-                    data = await resp.json(content_type=None)
-                    return int(data.get("serverTime", int(time.time() * 1000)))
+            session = await self._get_session()
+            async with session.get(
+                f"{self.BASE_URL}/api/v3/time",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                return int(data.get("serverTime", int(time.time() * 1000)))
         except Exception:
             # Fallback to local timestamp on timeout/network errors
             return int(time.time() * 1000)
@@ -108,53 +157,30 @@ class MexcRestClient:
 
         url = f"{self.BASE_URL}{path}"
         timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        session = await self._get_session()
         max_retries = 3
         backoff = 0.5
         last_err = None
         for _ in range(max_retries):
             try:
-                async with aiohttp.ClientSession(
-                    timeout=timeout,
-                    connector=aiohttp.TCPConnector(
-                        limit=100, limit_per_host=10, enable_cleanup_closed=True
-                    ),
-                ) as session:
-                    if method == "GET":
-                        async with session.get(
-                            url, params=params, headers=headers
-                        ) as resp:
-                            data = await resp.json(content_type=None)
-                            if resp.status != 200:
-                                # If timestamp window error, resync time and retry
-                                if (
-                                    isinstance(data, dict)
-                                    and data.get("code") == 700003
-                                ):
-                                    self._last_time_sync = 0.0
-                                    await self._ensure_time_offset()
-                                    raise aiohttp.ServerDisconnectedError()
-                                raise RuntimeError(data)
-                            return data
-                    elif method == "POST":
-                        if signed:
-                            # Send with params in query (no body) per official examples
-                            async with session.post(
-                                url, params=params, headers=headers
-                            ) as resp:
-                                data = await resp.json(content_type=None)
-                                if resp.status != 200:
-                                    if (
-                                        isinstance(data, dict)
-                                        and data.get("code") == 700003
-                                    ):
-                                        self._last_time_sync = 0.0
-                                        await self._ensure_time_offset()
-                                        raise aiohttp.ServerDisconnectedError()
-                                    raise RuntimeError(data)
-                                return data
-                        # Unsigned POST (rare): send JSON
+                if method == "GET":
+                    async with session.get(
+                        url, params=params, headers=headers, timeout=timeout
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        if resp.status != 200:
+                            # If timestamp window error, resync time and retry
+                            if isinstance(data, dict) and data.get("code") == 700003:
+                                self._last_time_sync = 0.0
+                                await self._ensure_time_offset()
+                                raise aiohttp.ServerDisconnectedError()
+                            raise RuntimeError(data)
+                        return data
+                elif method == "POST":
+                    if signed:
+                        # Send with params in query (no body) per official examples
                         async with session.post(
-                            url, json=params, headers=headers
+                            url, params=params, headers=headers, timeout=timeout
                         ) as resp:
                             data = await resp.json(content_type=None)
                             if resp.status != 200:
@@ -167,8 +193,20 @@ class MexcRestClient:
                                     raise aiohttp.ServerDisconnectedError()
                                 raise RuntimeError(data)
                             return data
-                    else:
-                        raise ValueError("Unsupported method")
+                    # Unsigned POST (rare): send JSON
+                    async with session.post(
+                        url, json=params, headers=headers, timeout=timeout
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        if resp.status != 200:
+                            if isinstance(data, dict) and data.get("code") == 700003:
+                                self._last_time_sync = 0.0
+                                await self._ensure_time_offset()
+                                raise aiohttp.ServerDisconnectedError()
+                            raise RuntimeError(data)
+                        return data
+                else:
+                    raise ValueError("Unsupported method")
             except (
                 aiohttp.ClientConnectorError,
                 aiohttp.ClientOSError,
