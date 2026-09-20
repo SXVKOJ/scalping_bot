@@ -7,11 +7,19 @@ from subscriptions.models import Subscription
 from bot.utils.user_autobuy_tasks import user_autobuy_tasks
 from bot.utils.mexc import handle_mexc_response
 from bot.utils.api_errors import parse_mexc_error
-from bot.utils.mexc_rest import MexcRestClient
+from bot.utils.mexc_rest import MexcRestClient, to_mexc_symbol, split_pair
 from bot.logger import logger
 from bot.utils.error_notifier import notify_user_autobuy_error
 from decimal import Decimal
-from bot.constants import MAX_FAILS
+from bot.constants import (
+    MAX_FAILS,
+    RISE_TREND_TOLERANCE_PCT,
+    RISE_MIN_PCT,
+    RISE_MAX_BUYS_PER_CYCLE,
+    RISE_BUY_COOLDOWN_SEC,
+    DROP_BUY_COOLDOWN_SEC,
+    BUY_RETRY_DELAY_SEC,
+)
 import json
 import time
 import weakref
@@ -41,6 +49,67 @@ def get_rest_client(telegram_id: int, user: User) -> MexcRestClient:
     return client
 
 
+def _num(value, default: float = 0.0) -> float:
+    """Безопасно приводит настройку к float (поля в БД nullable)."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int(value, default: int = 0) -> int:
+    """Безопасно приводит настройку к int (pause в БД может быть NULL)."""
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def arm_rise_trigger(state: dict, ask_price: float, current_time: float) -> None:
+    """Ставит (или переставляет) триггер роста на указанную ask-цену.
+
+    В отличие от reset_rise_trigger триггер остаётся ВКЛЮЧЁННЫМ: после неудачного
+    окна анализа бот продолжает ловить рост, а не замолкает до следующей сделки.
+    """
+    state["trigger_price"] = float(ask_price)
+    state["trigger_time"] = current_time
+    state["is_rise_trigger"] = True
+    state["is_trigger_activated"] = False
+    state["trigger_activated_time"] = 0
+    state["pause_trend_prices"] = []
+    state["pause_peak_mid"] = None
+    state["pause_start_mid"] = None
+    state["trend_only_rise"] = True
+    state["last_pause_price"] = None
+
+
+def schedule_buy_retry(telegram_id: int, why: str) -> None:
+    """Возвращает пользователя в режим ожидания новой возможности.
+
+    process_buy в начале сбрасывает waiting_for_opportunity/restart_after. Если
+    покупка падала с ошибкой, эти флаги так и оставались сброшенными, а
+    last_buy_price — None: основной цикл больше никогда не заходил в ветку
+    повторной покупки, и бот молча простаивал при живом автобае.
+    """
+    state = autobuy_states.get(telegram_id)
+    if not state:
+        return
+    if state.get("active_orders"):
+        # Есть открытые сделки — цикл продолжится по их закрытию.
+        return
+    state["waiting_for_opportunity"] = True
+    state["restart_after"] = time.time() + BUY_RETRY_DELAY_SEC
+    state["waiting_reported"] = False
+    logger.info(
+        f"Покупка для {telegram_id} не состоялась ({why}); "
+        f"повтор через {BUY_RETRY_DELAY_SEC:.0f}с"
+    )
+
+
 async def _safe_send(telegram_id: int, text: str):
     """Отправка уведомления, не влияющая на скорость покупки (fire-and-forget)."""
     try:
@@ -67,7 +136,8 @@ async def autobuy_loop(message: Message, telegram_id: int):
 
             user = await sync_to_async(User.objects.get)(telegram_id=telegram_id)
             rest = MexcRestClient(api_key=user.api_key, api_secret=user.api_secret)
-            symbol = user.pair.replace("/", "")
+            symbol = to_mexc_symbol(user.pair)
+            base_asset, quote_asset = split_pair(user.pair)
 
             # Инициализируем состояние для пользователя, если его еще нет
             if telegram_id not in autobuy_states:
@@ -105,14 +175,18 @@ async def autobuy_loop(message: Message, telegram_id: int):
                     "cached_pause": 0,  # Кеш настройки "пауза" (сек)
                     "autobuy_active": True,  # Кеш флага автобая (без запроса в БД на тике)
                     "rest_client": None,  # Переиспользуемый REST-клиент (keep-alive)
+                    "resource_task": None,  # Задача periodic_resource_check
+                    "pause_peak_mid": None,  # Максимум mid внутри окна анализа роста
+                    "pause_start_mid": None,  # mid на старте окна анализа роста
+                    "last_rise_buy_time": 0,  # Время последней покупки на росте
                 }
 
             # Кешируем настройки в память, чтобы hot-path (обработчик тиков)
             # не ходил в БД на каждом обновлении цены. Кеш обновляется в
             # основном цикле (10с) и в periodic_resource_check (60с).
-            autobuy_states[telegram_id]["cached_loss"] = float(user.loss)
-            autobuy_states[telegram_id]["cached_profit"] = float(user.profit)
-            autobuy_states[telegram_id]["cached_pause"] = user.pause
+            autobuy_states[telegram_id]["cached_loss"] = _num(user.loss)
+            autobuy_states[telegram_id]["cached_profit"] = _num(user.profit)
+            autobuy_states[telegram_id]["cached_pause"] = _int(user.pause)
             autobuy_states[telegram_id]["autobuy_active"] = True
             autobuy_states[telegram_id]["rest_client"] = rest
 
@@ -178,9 +252,14 @@ async def autobuy_loop(message: Message, telegram_id: int):
                     # Настройки берём из кеша в памяти (обновляются в фоновых циклах),
                     # чтобы не ходить в БД на каждом тике bookTicker
                     loss_threshold = state.get("cached_loss")
-                    pause_seconds = state.get("cached_pause", 0)
+                    pause_seconds = _int(state.get("cached_pause"), 0)
                     if loss_threshold is None:
                         return
+                    loss_threshold = _num(loss_threshold)
+                    if loss_threshold <= 0:
+                        # Падение не настроено — покупки на падении отключены,
+                        # но триггеры роста должны продолжать работать.
+                        loss_threshold = None
 
                     # Обновляем текущую цену
                     autobuy_states[telegram_id]["current_price"] = mid_price
@@ -198,7 +277,7 @@ async def autobuy_loop(message: Message, telegram_id: int):
 
                     # Проверяем условия для покупок на падении (используем ask цену)
                     last_buy_price = autobuy_states[telegram_id]["last_buy_price"]
-                    if last_buy_price is not None:
+                    if last_buy_price is not None and loss_threshold is not None:
                         ask_price = float(ask_price)
                         price_drop_percent = (
                             ((last_buy_price - ask_price) / last_buy_price * 100)
@@ -211,18 +290,21 @@ async def autobuy_loop(message: Message, telegram_id: int):
 
                         if (
                             price_drop_percent >= loss_threshold
-                            and (current_time - last_drop_notification) > 10
+                            and (current_time - last_drop_notification)
+                            > DROP_BUY_COOLDOWN_SEC
                         ):
-                            autobuy_states[telegram_id]["last_drop_notification"] = (
-                                current_time
-                            )
-
-                            # Защита от параллельных покупок — проверяем ДО запуска
+                            # Защита от параллельных покупок — проверяем ДО запуска.
+                            # Антидребезг взводим только если покупка реально
+                            # стартует, иначе один пропуск глушил сигнал на 10с.
                             if state.get("buy_in_progress"):
                                 logger.info(
                                     f"Skip price_drop buy: buy_in_progress for {telegram_id}"
                                 )
                                 return
+
+                            autobuy_states[telegram_id]["last_drop_notification"] = (
+                                current_time
+                            )
 
                             # СНАЧАЛА запускаем покупку (критично по времени).
                             # Уведомление в Telegram отправляем отдельной задачей,
@@ -250,8 +332,8 @@ async def autobuy_loop(message: Message, telegram_id: int):
                             # Уведомление о падении — не блокирует ордер
                             drop_text = (
                                 f"🔻 Обнаружено падение цены для {symbol_name}\n\n"
-                                f"🔻 Цена ({ask_price:.6f} USDC) снизилась на {price_drop_percent:.2f}% "
-                                f"от покупки по {last_buy_price:.6f} USDC. \n"
+                                f"🔻 Цена ({ask_price:.6f} {quote_asset}) снизилась на {price_drop_percent:.2f}% "
+                                f"от покупки по {last_buy_price:.6f} {quote_asset}. \n"
                                 f"Покупаем по условию падения ({loss_threshold:.2f}%)."
                             )
                             asyncio.create_task(_safe_send(telegram_id, drop_text))
@@ -261,6 +343,22 @@ async def autobuy_loop(message: Message, telegram_id: int):
                         f"Ошибка в обработчике bookTicker autobuy для {telegram_id} ({symbol_name}): {e}",
                         exc_info=True,
                     )
+
+            # Снимаем колбэки предыдущей итерации цикла: без этого после
+            # каждого перезапуска autobuy_loop на один тик приходило несколько
+            # обработчиков, что давало дублирующие покупки.
+            for stale_callback in list(
+                autobuy_states[telegram_id]["bookticker_callbacks"]
+            ):
+                try:
+                    await websocket_manager.unregister_bookticker_callback(
+                        symbol, stale_callback
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Не удалось снять старый bookTicker колбэк для {telegram_id}: {e}"
+                    )
+            autobuy_states[telegram_id]["bookticker_callbacks"] = []
 
             # Регистрируем колбэк с WebSocket менеджером
             await websocket_manager.register_bookticker_callback(
@@ -288,14 +386,18 @@ async def autobuy_loop(message: Message, telegram_id: int):
                 )
                 await process_buy(telegram_id, "initial_purchase", message, user)
 
-            # Планируем задачу проверки ресурсов
-            asyncio.create_task(periodic_resource_check(telegram_id))
+            # Планируем задачу проверки ресурсов (одну на пользователя)
+            resource_task = autobuy_states[telegram_id].get("resource_task")
+            if resource_task is None or resource_task.done():
+                autobuy_states[telegram_id]["resource_task"] = asyncio.create_task(
+                    periodic_resource_check(telegram_id)
+                )
 
             # Сообщаем пользователю, что автобай активирован
             await message.answer(
                 f"✅ *Автобай активирован*\n\n"
-                f"📊 Текущая цена: `{current_price:.6f}` {symbol[3:]}\n"
-                f"💰 Сумма закупки: `{user.buy_amount}` {symbol[3:]}\n"
+                f"📊 Текущая цена: `{current_price:.6f}` {quote_asset}\n"
+                f"💰 Сумма закупки: `{user.buy_amount}` {quote_asset}\n"
                 f"📈 Профит: `{user.profit}%`\n"
                 f"📉 Падение: `{user.loss}%`\n"
                 f"⏱️ Пауза: `{user.pause}` сек\n",
@@ -312,9 +414,9 @@ async def autobuy_loop(message: Message, telegram_id: int):
                     )
                     st = autobuy_states.get(telegram_id)
                     if st is not None:
-                        st["cached_loss"] = float(fresh.loss)
-                        st["cached_profit"] = float(fresh.profit)
-                        st["cached_pause"] = fresh.pause
+                        st["cached_loss"] = _num(fresh.loss)
+                        st["cached_profit"] = _num(fresh.profit)
+                        st["cached_pause"] = _int(fresh.pause)
                         st["autobuy_active"] = bool(fresh.autobuy)
                 except Exception as e:
                     logger.error(
@@ -400,7 +502,7 @@ async def autobuy_loop(message: Message, telegram_id: int):
                         user = await sync_to_async(User.objects.get)(
                             telegram_id=telegram_id
                         )
-                        symbol_to_unregister = user.pair.replace("/", "")
+                        symbol_to_unregister = to_mexc_symbol(user.pair)
                         if symbol_to_unregister in websocket_manager.price_callbacks:
                             if (
                                 callback
@@ -422,7 +524,7 @@ async def autobuy_loop(message: Message, telegram_id: int):
                         user = await sync_to_async(User.objects.get)(
                             telegram_id=telegram_id
                         )
-                        symbol_to_unregister = user.pair.replace("/", "")
+                        symbol_to_unregister = to_mexc_symbol(user.pair)
                         await websocket_manager.unregister_bookticker_callback(
                             symbol_to_unregister, callback
                         )
@@ -485,7 +587,7 @@ async def autobuy_loop(message: Message, telegram_id: int):
                     # Clean up price callbacks
                     for callback in autobuy_states[telegram_id]["price_callbacks"]:
                         try:
-                            symbol_to_unregister = user.pair.replace("/", "")
+                            symbol_to_unregister = to_mexc_symbol(user.pair)
                             if (
                                 symbol_to_unregister
                                 in websocket_manager.price_callbacks
@@ -507,7 +609,7 @@ async def autobuy_loop(message: Message, telegram_id: int):
                     # Clean up bookTicker callbacks
                     for callback in autobuy_states[telegram_id]["bookticker_callbacks"]:
                         try:
-                            symbol_to_unregister = user.pair.replace("/", "")
+                            symbol_to_unregister = to_mexc_symbol(user.pair)
                             await websocket_manager.unregister_bookticker_callback(
                                 symbol_to_unregister, callback
                             )
@@ -591,11 +693,17 @@ async def process_buy(
         lock = asyncio.Lock()
         state["buy_lock"] = lock
 
-    if state.get("buy_in_progress"):
+    if state.get("buy_in_progress") or lock.locked():
         logger.info(f"Skip process_buy: buy_in_progress for {telegram_id}")
         return
 
     await lock.acquire()
+    # Повторная проверка ПОД блокировкой: между быстрой проверкой выше и
+    # захватом lock другая задача могла уже начать покупку.
+    if state.get("buy_in_progress"):
+        logger.info(f"Skip process_buy (after lock): buy_in_progress for {telegram_id}")
+        lock.release()
+        return
     state["buy_in_progress"] = True
 
     try:
@@ -626,15 +734,16 @@ async def process_buy(
         try:
             # Отправляем сообщение о начале покупки для лучшей обратной связи
             if reason == "after_waiting_period":
-                symbol = user.pair.replace("/", "")
+                symbol = to_mexc_symbol(user.pair)
                 current_price = autobuy_states[telegram_id].get("current_price", 0)
-                # await message.answer(f"🔄 Возобновляем автобай для {symbol} после паузы. Текущая цена: {current_price:.6f} {symbol[3:]}")
+                # await message.answer(f"🔄 Возобновляем автобай для {symbol} после паузы. Текущая цена: {current_price:.6f} {quote_asset}")
 
             rest = get_rest_client(telegram_id, user)
-            symbol = user.pair.replace("/", "")
+            symbol = to_mexc_symbol(user.pair)
+            base_asset, quote_asset = split_pair(user.pair)
             buy_amount = float(user.buy_amount)
-            profit_percent = float(user.profit)
-            pause_seconds = user.pause  # Для использования после покупки
+            profit_percent = _num(user.profit)
+            pause_seconds = _int(user.pause)  # Для использования после покупки
 
             # Логируем начало покупки
             logger.info(f"Начинаем покупку для {telegram_id}, причина: {reason}")
@@ -670,6 +779,8 @@ async def process_buy(
                     await message.answer(
                         "⛔ Автобай остановлен после 3 последовательных ошибок при создании ордеров."
                     )
+                else:
+                    schedule_buy_retry(telegram_id, "executedQty=0")
                 return
 
             spent = float(order_info["cummulativeQuoteQty"])
@@ -684,6 +795,8 @@ async def process_buy(
                     await message.answer(
                         "⛔ Автобай остановлен после 3 последовательных ошибок при создании ордеров."
                     )
+                else:
+                    schedule_buy_retry(telegram_id, "spent=0")
                 return
 
             # Сбрасываем счетчик ошибок при успешной покупке
@@ -703,7 +816,7 @@ async def process_buy(
             user_settings = await sync_to_async(User.objects.get)(
                 telegram_id=telegram_id
             )
-            profit_percent = float(user_settings.profit)
+            profit_percent = _num(user_settings.profit)
             sell_price = round(real_price * (1 + profit_percent / 100), 6)
 
             # Создание лимитного ордера на продажу
@@ -720,7 +833,7 @@ async def process_buy(
             handle_mexc_response(sell_order, "Продажа")
             sell_order_id = sell_order["orderId"]
             logger.info(
-                f"SELL ордер {sell_order_id} выставлен на {sell_price:.6f} {symbol[3:]}"
+                f"SELL ордер {sell_order_id} выставлен на {sell_price:.6f} {quote_asset}"
             )
 
             # Сохраняем ордер в базу
@@ -774,10 +887,10 @@ async def process_buy(
                 await bot_instance.send_message(
                     telegram_id,
                     f"🟢 *СДЕЛКА {user_order_number} ОТКРЫТА*\n\n"
-                    f"📉 Куплено по: `{real_price:.6f}` {symbol[3:]}\n"
-                    f"📦 Кол-во: `{executed_qty:.6f}` {symbol[:3]}\n"
-                    f"💸 Потрачено: `{spent:.2f}` {symbol[3:]}\n\n"
-                    f"📈 Лимит на продажу: `{sell_price:.6f}` {symbol[3:]}\n",
+                    f"📉 Куплено по: `{real_price:.6f}` {quote_asset}\n"
+                    f"📦 Кол-во: `{executed_qty:.6f}` {base_asset}\n"
+                    f"💸 Потрачено: `{spent:.2f}` {quote_asset}\n\n"
+                    f"📈 Лимит на продажу: `{sell_price:.6f}` {quote_asset}\n",
                     parse_mode="Markdown",
                 )
             except Exception as e:
@@ -786,10 +899,10 @@ async def process_buy(
                 try:
                     await message.answer(
                         f"🟢 *СДЕЛКА {user_order_number} ОТКРЫТА*\n\n"
-                        f"📉 Куплено по: `{real_price:.6f}` {symbol[3:]}\n"
-                        f"📦 Кол-во: `{executed_qty:.6f}` {symbol[:3]}\n"
-                        f"💸 Потрачено: `{spent:.2f}` {symbol[3:]}\n\n"
-                        f"📈 Лимит на продажу: `{sell_price:.6f}` {symbol[3:]}\n",
+                        f"📉 Куплено по: `{real_price:.6f}` {quote_asset}\n"
+                        f"📦 Кол-во: `{executed_qty:.6f}` {base_asset}\n"
+                        f"💸 Потрачено: `{spent:.2f}` {quote_asset}\n\n"
+                        f"📈 Лимит на продажу: `{sell_price:.6f}` {quote_asset}\n",
                         parse_mode="Markdown",
                     )
                 except Exception as fallback_error:
@@ -797,43 +910,26 @@ async def process_buy(
                         f"Failed to send buy notification via fallback to {telegram_id}: {fallback_error}"
                     )
 
-            # Устанавливаем триггер для покупок на росте после любой покупки или продажи
-            if reason in [
-                "price_rise",
-                "price_drop",
-                "new_buy_cycle",
-                "initial_purchase",
-                "after_waiting_period",
-                "rise_trigger",
-            ]:
-                # Получаем текущую цену из bookTicker
-                bookticker_data = websocket_manager.get_current_bookticker(symbol)
-                if bookticker_data:
-                    ask_price = float(
-                        bookticker_data["ask_price"]
-                    )  # Используем ask цену
-                    current_time = time.time()
-
-                    # Устанавливаем триггер на росте по ask цене
-                    autobuy_states[telegram_id]["trigger_price"] = ask_price
-                    autobuy_states[telegram_id]["trigger_time"] = current_time
-                    autobuy_states[telegram_id]["is_rise_trigger"] = True
-                    autobuy_states[telegram_id]["is_trigger_activated"] = False
-                    autobuy_states[telegram_id]["trigger_activated_time"] = 0
-                    autobuy_states[telegram_id]["pause_trend_prices"] = []
-                    autobuy_states[telegram_id]["trend_only_rise"] = True
-                    autobuy_states[telegram_id]["last_pause_price"] = None
-
-                    logger.info(
-                        f"Rise trigger set for {telegram_id} at ask price {ask_price:.6f} after {reason}"
-                    )
-                else:
-                    logger.warning(
-                        f"Could not set rise trigger for {telegram_id}: no bookTicker data available"
-                    )
+            # Перевзводим триггер роста после ЛЮБОЙ покупки. Раньше здесь был
+            # белый список причин, в который не попадал "after_waiting_period_main_loop",
+            # и после обычного цикла покупки на росте больше не срабатывали.
+            bookticker_data = websocket_manager.get_current_bookticker(symbol)
+            if bookticker_data:
+                trigger_ask = float(bookticker_data["ask_price"])
+                arm_rise_trigger(autobuy_states[telegram_id], trigger_ask, time.time())
+                logger.info(
+                    f"Rise trigger set for {telegram_id} at ask price {trigger_ask:.6f} after {reason}"
+                )
+            else:
+                # Без bookTicker берём цену последней покупки — лучше, чем
+                # остаться вообще без триггера роста.
+                arm_rise_trigger(autobuy_states[telegram_id], real_price, time.time())
+                logger.warning(
+                    f"No bookTicker data for {telegram_id}: rise trigger armed at fill price {real_price:.6f}"
+                )
 
             # Если это была покупка на росте, устанавливаем паузу ПОСЛЕ покупки
-            if reason == "price_rise" and pause_seconds > 0:
+            if reason in ("price_rise", "rise_trigger") and pause_seconds > 0:
                 # Устанавливаем время возобновления после паузы
                 autobuy_states[telegram_id]["waiting_for_opportunity"] = True
                 autobuy_states[telegram_id]["restart_after"] = (
@@ -868,6 +964,8 @@ async def process_buy(
                 logger.warning(
                     f"Автобай остановлен для {telegram_id} после 3 последовательных ошибок"
                 )
+            else:
+                schedule_buy_retry(telegram_id, f"ошибка покупки: {error_message}")
 
         finally:
             # Закрываем сессию, если она была создана
@@ -884,6 +982,7 @@ async def process_buy(
             await notify_user_autobuy_error(telegram_id, "при выполнении покупки", e)
         except Exception:
             pass
+        schedule_buy_retry(telegram_id, f"исключение: {error_message}")
     finally:
         # Всегда освобождаем блокировку и сбрасываем флаг
         try:
@@ -905,15 +1004,21 @@ async def check_rise_triggers(
     pause_seconds: int,
 ):
     """
-    Проверяет триггеры для покупок на росте цены с правильным анализом тренда.
+    Проверяет триггеры для покупок на росте цены.
 
     Логика:
-    1. Триггер устанавливается на ask_price (цена продажи)
-    2. Активация триггера - при пересечении ask_price уровня trigger_price (в любую сторону)
-    3. Начало отсчета паузы - при активации триггера
-    4. Анализ тренда во время паузы - mid цена должна только расти (без единого падения)
-    5. Сброс при малейшем движении вниз mid цены → сброс триггера
-    6. Ожидание нового пересечения триггера
+    1. Триггер стоит на ask_price последней покупки/продажи.
+    2. Активация — когда ask достигает уровня триггера или уходит выше.
+    3. С момента активации открывается окно анализа длиной pause_seconds.
+    4. Внутри окна mid-цена должна расти. Допускается откат не глубже
+       RISE_TREND_TOLERANCE_PCT от максимума окна — иначе на реальном рынке
+       (тики каждые 100 мс) условие "ни одного тика вниз" не выполняется
+       практически никогда, и покупки на росте не происходили вообще.
+    5. Откат глубже допуска — окно закрывается, а триггер ПЕРЕВЗВОДИТСЯ на
+       текущую цену. Раньше здесь вызывался reset_rise_trigger, который
+       полностью выключал механизм роста до следующей сделки.
+    6. По истечении окна покупаем, если ask выше уровня триггера (минимум на
+       RISE_MIN_PCT) и mid не ушла ниже точки старта окна.
     """
     try:
         if telegram_id not in autobuy_states:
@@ -923,130 +1028,148 @@ async def check_rise_triggers(
         ask_price_float = float(ask_price)
         bid_price_float = float(bid_price)
         mid_price = (bid_price_float + ask_price_float) / 2
+        pause_seconds = _int(pause_seconds, 0)
 
         # Инициализация и сохранение предыдущих цен
         prev_ask_price = state.get("last_ask_price")
-        prev_mid_price = state.get("last_mid_price")
         state["last_ask_price"] = ask_price_float
         state["last_mid_price"] = mid_price
 
         # Проверяем, что триггер установлен
-        if state.get("is_rise_trigger") and state.get("trigger_price") is not None:
-            trigger_price = state["trigger_price"]
-            is_activated = state.get("is_trigger_activated", False)
+        if not state.get("is_rise_trigger") or state.get("trigger_price") is None:
+            return
 
-            # ЭТАП 1: Активация триггера при пересечении уровня в любую сторону
-            if not is_activated:
-                if prev_ask_price is not None:
-                    crossed_up = prev_ask_price <= trigger_price < ask_price_float
-                    crossed_down = prev_ask_price >= trigger_price > ask_price_float
-                    if crossed_up or crossed_down:
-                        # Запускаем паузу и анализ тренда (используем mid цену)
-                        state["is_trigger_activated"] = True
-                        state["trigger_activated_time"] = current_time
-                        state["pause_trend_prices"] = [mid_price]  # Сохраняем mid цену
-                        state["trend_only_rise"] = True
-                        state["last_pause_price"] = mid_price
+        trigger_price = float(state["trigger_price"])
+        is_activated = state.get("is_trigger_activated", False)
 
-                        direction = "↑" if crossed_up else "↓"
-                        logger.info(
-                            f"Trigger crossed {direction} for {telegram_id}: "
-                            f"ask {prev_ask_price:.6f} → {ask_price_float:.6f}, "
-                            f"mid {mid_price:.6f}. Starting {pause_seconds}s pause."
-                        )
-                        # Уведомление об активации триггера (закомментировано)
-                        # from bot.config import bot_instance
-                        # try:
-                        #     await bot_instance.send_message(
-                        #         telegram_id,
-                        #         f"🔔 Триггер активирован для {symbol}\n\n"
-                        #         f"📈 Цена ({ask_price_float:.6f} USDC) пересекла триггер {trigger_price:.6f} USDC\n"
-                        #         f"⏱️ Начинаем анализ тренда на {pause_seconds}с"
-                        #     )
-                        #     logger.info(f"Trigger activation notification sent to {telegram_id}")
-                        # except Exception as e:
-                        #     logger.error(f"Failed to send trigger activation notification to {telegram_id}: {e}")
+        # ЭТАП 1: Активация — ask дошёл до уровня триггера или выше.
+        # Раньше требовалось строгое пересечение уровня между двумя соседними
+        # тиками (prev_ask <= trigger < ask). Триггер ставится по ask в момент
+        # сделки, и на быстром движении бот успевал "перепрыгнуть" уровень
+        # между тиками: пересечения не было, окно анализа не открывалось и
+        # покупка на росте не происходила вообще.
+        if not is_activated:
+            if ask_price_float < trigger_price:
+                return
 
-            # ЭТАП 2: Анализ тренда во время паузы
-            else:
-                triggered_time = state.get("trigger_activated_time", 0)
-                pause_prices = state.get("pause_trend_prices", [])
+            state["is_trigger_activated"] = True
+            state["trigger_activated_time"] = current_time
+            state["pause_trend_prices"] = [mid_price]
+            state["pause_start_mid"] = mid_price
+            state["pause_peak_mid"] = mid_price
+            state["trend_only_rise"] = True
+            state["last_pause_price"] = mid_price
 
-                # 2.1 Сброс при любом движении вниз mid цены относительно prev_mid_price
-                if prev_mid_price is not None and mid_price < prev_mid_price:
-                    logger.info(
-                        f"Mid price drop detected for {telegram_id}: {prev_mid_price:.6f} → {mid_price:.6f}. Resetting trigger."
-                    )
-                    reset_rise_trigger(state)
-                    return
+            logger.info(
+                f"Rise trigger activated for {telegram_id}: "
+                f"ask {prev_ask_price if prev_ask_price is not None else ask_price_float:.6f}"
+                f" → {ask_price_float:.6f} (level {trigger_price:.6f}), "
+                f"mid {mid_price:.6f}. Окно анализа {pause_seconds}с."
+            )
+            return
 
-                # 2.2 Добавляем текущую mid цену в историю паузы
-                pause_prices.append(mid_price)
-                state["pause_trend_prices"] = pause_prices
+        # ЭТАП 2: Анализ тренда внутри окна
+        triggered_time = state.get("trigger_activated_time", 0)
+        start_mid = state.get("pause_start_mid")
+        peak_mid = state.get("pause_peak_mid")
+        if start_mid is None:
+            start_mid = mid_price
+            state["pause_start_mid"] = start_mid
+        if peak_mid is None:
+            peak_mid = mid_price
 
-                # 2.3 Проверяем завершение паузы
-                elapsed = current_time - triggered_time
-                if elapsed >= pause_seconds:
-                    # Если рост без единого падения и ask цена выше триггера — покупаем
-                    if (
-                        state.get("trend_only_rise", True)
-                        and ask_price_float > trigger_price
-                    ):
-                        logger.info(
-                            f"Rise conditions met for {telegram_id}: exclusive mid price rise during {pause_seconds}s pause. "
-                            f"Final ask: {ask_price_float:.6f}, final mid: {mid_price:.6f}"
-                        )
+        if mid_price > peak_mid:
+            peak_mid = mid_price
+        state["pause_peak_mid"] = peak_mid
 
-                        # Уведомление о покупке
-                        from bot.config import bot_instance
+        # 2.1 Откат глубже допуска — окно закрывается, триггер перевзводим
+        drawdown_pct = ((peak_mid - mid_price) / peak_mid * 100) if peak_mid > 0 else 0
+        if drawdown_pct > RISE_TREND_TOLERANCE_PCT:
+            logger.info(
+                f"Rise window cancelled for {telegram_id}: drawdown {drawdown_pct:.3f}% "
+                f"> {RISE_TREND_TOLERANCE_PCT:.3f}% (peak {peak_mid:.6f} → {mid_price:.6f}). "
+                f"Re-arming trigger at {ask_price_float:.6f}."
+            )
+            arm_rise_trigger(state, ask_price_float, current_time)
+            return
 
-                        try:
-                            await bot_instance.send_message(
-                                telegram_id,
-                                f"⏫ Покупка по росту для {symbol}\n\n"
-                                f"📈 Исключительный рост {pause_seconds}с\n"
-                                f"🎯 Цена: {trigger_price:.6f} → {ask_price_float:.6f} USDC\n"
-                                f"💰 Совершаем покупку!",
-                            )
-                            logger.info(
-                                f"Rise purchase notification sent to {telegram_id}"
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Failed to send rise purchase notification to {telegram_id}: {e}"
-                            )
+        # 2.2 Копим историю окна (с ограничением, чтобы не течь по памяти)
+        pause_prices = state.get("pause_trend_prices", [])
+        pause_prices.append(mid_price)
+        if len(pause_prices) > 500:
+            pause_prices = pause_prices[-500:]
+        state["pause_trend_prices"] = pause_prices
 
-                        # Совершаем покупку
-                        from bot.utils.autobuy_restart import FakeMessage
-                        from bot.config import bot_instance
+        # 2.3 Окно ещё не закончилось
+        if (current_time - triggered_time) < pause_seconds:
+            return
 
-                        fake_message = FakeMessage(telegram_id, bot_instance)
-                        asyncio.create_task(
-                            process_buy(
-                                telegram_id, "rise_trigger", fake_message, None
-                            )
-                        )
+        # 2.4 Итог окна
+        required_price = trigger_price * (1 + RISE_MIN_PCT / 100)
+        rise_confirmed = (
+            ask_price_float > trigger_price
+            and ask_price_float >= required_price
+            and mid_price >= start_mid
+        )
+        if not rise_confirmed:
+            logger.info(
+                f"Rise conditions NOT met for {telegram_id}. ask={ask_price_float:.6f}, "
+                f"trigger={trigger_price:.6f}, mid={mid_price:.6f}, start_mid={start_mid:.6f}. "
+                f"Re-arming trigger."
+            )
+            arm_rise_trigger(state, ask_price_float, current_time)
+            return
 
-                        # Устанавливаем новый триггер по текущей цене
-                        state["trigger_price"] = ask_price_float
-                        state["trigger_time"] = current_time
-                        state["is_trigger_activated"] = False
-                        state["rise_buy_count"] += 1
+        # Ограничения: не более RISE_MAX_BUYS_PER_CYCLE покупок на росте
+        # в рамках одного цикла и не чаще RISE_BUY_COOLDOWN_SEC.
+        if state.get("rise_buy_count", 0) >= RISE_MAX_BUYS_PER_CYCLE:
+            logger.info(
+                f"Rise buy limit reached for {telegram_id} "
+                f"({RISE_MAX_BUYS_PER_CYCLE} per cycle). Skipping."
+            )
+            arm_rise_trigger(state, ask_price_float, current_time)
+            return
 
-                        # Очищаем данные паузы
-                        state["pause_trend_prices"] = []
-                        state["trend_only_rise"] = True
-                        state["last_pause_price"] = None
+        if (current_time - state.get("last_rise_buy_time", 0)) < RISE_BUY_COOLDOWN_SEC:
+            return
 
-                        logger.info(
-                            f"New rise trigger set for {telegram_id} at ask price {ask_price_float:.6f}"
-                        )
-                    else:
-                        logger.info(
-                            f"Rise conditions NOT met for {telegram_id}. Final price: {ask_price_float:.6f}, "
-                            f"trend_only_rise: {state.get('trend_only_rise', False)}"
-                        )
-                        reset_rise_trigger(state)
+        if state.get("buy_in_progress"):
+            logger.info(f"Skip rise buy: buy_in_progress for {telegram_id}")
+            return
+
+        logger.info(
+            f"Rise conditions met for {telegram_id}: window {pause_seconds}s, "
+            f"trigger {trigger_price:.6f} → ask {ask_price_float:.6f}, "
+            f"max drawdown within window {drawdown_pct:.3f}%"
+        )
+
+        # Сначала ордер, уведомление — отдельной задачей
+        trigger_ts = time.perf_counter()
+        from bot.utils.autobuy_restart import FakeMessage
+        from bot.config import bot_instance
+
+        fake_message = FakeMessage(telegram_id, bot_instance)
+
+        state["last_rise_buy_time"] = current_time
+        state["rise_buy_count"] = state.get("rise_buy_count", 0) + 1
+
+        asyncio.create_task(
+            process_buy(telegram_id, "rise_trigger", fake_message, None, trigger_ts)
+        )
+
+        asyncio.create_task(
+            _safe_send(
+                telegram_id,
+                f"⏫ Покупка по росту для {symbol}\n\n"
+                f"📈 Рост удержан {pause_seconds}с\n"
+                f"🎯 Цена: {trigger_price:.6f} → {ask_price_float:.6f}\n"
+                f"💰 Совершаем покупку!",
+            )
+        )
+
+        # Перевзводим триггер от текущей цены. Если покупка пройдёт успешно,
+        # process_buy переставит его ещё раз по факту исполнения.
+        arm_rise_trigger(state, ask_price_float, current_time)
 
     except Exception as e:
         logger.error(
@@ -1055,13 +1178,19 @@ async def check_rise_triggers(
 
 
 def reset_rise_trigger(state):
-    """Сбрасывает триггер на росте и очищает связанные данные"""
+    """Полностью выключает триггер на росте (используется при остановке автобая).
+
+    Для штатного перезапуска окна анализа используйте arm_rise_trigger: он
+    оставляет механизм роста включённым.
+    """
     state["is_rise_trigger"] = False
     state["trigger_price"] = None
     state["trigger_time"] = 0
     state["is_trigger_activated"] = False
     state["trigger_activated_time"] = 0
     state["pause_trend_prices"] = []
+    state["pause_peak_mid"] = None
+    state["pause_start_mid"] = None
     state["trend_only_rise"] = True
     state["last_pause_price"] = None
     state["last_ask_price"] = None
@@ -1110,21 +1239,18 @@ async def process_order_update_for_autobuy(order_id, symbol, status, user_id):
             try:
                 from bot.utils.websocket_manager import websocket_manager
 
-                bookticker_data = websocket_manager.get_current_bookticker(symbol)
+                bookticker_data = websocket_manager.get_current_bookticker(
+                    to_mexc_symbol(symbol)
+                )
                 if bookticker_data:
                     ask_price = float(
                         bookticker_data["ask_price"]
                     )  # Используем ask цену
                     current_time = time.time()
 
-                    autobuy_states[user_id]["trigger_price"] = ask_price
-                    autobuy_states[user_id]["trigger_time"] = current_time
-                    autobuy_states[user_id]["is_rise_trigger"] = True
-                    autobuy_states[user_id]["is_trigger_activated"] = False
-                    autobuy_states[user_id]["trigger_activated_time"] = 0
-                    autobuy_states[user_id]["pause_trend_prices"] = []
-                    autobuy_states[user_id]["trend_only_rise"] = True
-                    autobuy_states[user_id]["last_pause_price"] = None
+                    arm_rise_trigger(
+                        autobuy_states[user_id], ask_price, current_time
+                    )
                     autobuy_states[user_id]["last_ask_price"] = None
                     autobuy_states[user_id]["last_mid_price"] = None
 
@@ -1148,7 +1274,10 @@ async def process_order_update_for_autobuy(order_id, symbol, status, user_id):
                 # Получаем пользовательские настройки для определения паузы
                 try:
                     user = await sync_to_async(User.objects.get)(telegram_id=user_id)
-                    pause_seconds = user.pause
+                    pause_seconds = _int(user.pause)
+
+                    # Цикл закрыт — разрешаем покупки на росте в новом цикле
+                    autobuy_states[user_id]["rise_buy_count"] = 0
 
                     # Устанавливаем время следующей возможной покупки
                     autobuy_states[user_id]["last_buy_price"] = None
@@ -1165,8 +1294,14 @@ async def process_order_update_for_autobuy(order_id, symbol, status, user_id):
                     logger.error(
                         f"[AutobuyOrderUpdate] User {user_id}: Error getting user settings for pause: {e}"
                     )
-                    # Если не удалось получить настройки паузы, просто сбрасываем last_buy_price
+                    # Если не удалось получить настройки паузы — всё равно
+                    # переводим в режим ожидания, иначе основной цикл никогда
+                    # не запустит следующую покупку.
                     autobuy_states[user_id]["last_buy_price"] = None
+                    autobuy_states[user_id]["rise_buy_count"] = 0
+                    autobuy_states[user_id]["waiting_for_opportunity"] = True
+                    autobuy_states[user_id]["restart_after"] = time.time()
+                    autobuy_states[user_id]["waiting_reported"] = False
                     logger.info(
                         f"[AutobuyOrderUpdate] User {user_id}: Reset last_buy_price to None (error case)."
                     )
@@ -1242,14 +1377,14 @@ async def periodic_resource_check(telegram_id: int):
 
             # Проверяем соединение с WebSocket и восстанавливаем при необходимости
             user = await sync_to_async(User.objects.get)(telegram_id=telegram_id)
-            symbol = user.pair.replace("/", "")
+            symbol = to_mexc_symbol(user.pair)
 
             # Дублируем обновление кеша настроек (страховка, если основной цикл занят)
             st = autobuy_states.get(telegram_id)
             if st is not None:
-                st["cached_loss"] = float(user.loss)
-                st["cached_profit"] = float(user.profit)
-                st["cached_pause"] = user.pause
+                st["cached_loss"] = _num(user.loss)
+                st["cached_profit"] = _num(user.profit)
+                st["cached_pause"] = _int(user.pause)
                 st["autobuy_active"] = bool(user.autobuy)
 
             if not websocket_manager.market_connection:
@@ -1263,13 +1398,25 @@ async def periodic_resource_check(telegram_id: int):
                     )
                     return
 
-            if symbol not in websocket_manager.market_subscriptions:
-                logger.warning(f"Подписка на {symbol} отсутствует, переподписываемся")
-                success = await websocket_manager.subscribe_market_data([symbol])
+            if symbol not in websocket_manager.bookticker_subscriptions:
+                logger.warning(
+                    f"Подписка на bookTicker {symbol} отсутствует, переподписываемся"
+                )
+                success = await websocket_manager.subscribe_bookticker_data([symbol])
                 if not success:
                     logger.error(
-                        f"Не удалось подписаться на {symbol} для {telegram_id}"
+                        f"Не удалось подписаться на bookTicker {symbol} для {telegram_id}"
                     )
+
+            # Колбэк мог потеряться при переподключении — проверяем, что он на месте
+            registered = websocket_manager.bookticker_callbacks.get(symbol, [])
+            expected = autobuy_states[telegram_id].get("bookticker_callbacks", [])
+            for cb in expected:
+                if cb not in registered:
+                    logger.warning(
+                        f"bookTicker колбэк для {telegram_id} ({symbol}) пропал, регистрируем заново"
+                    )
+                    await websocket_manager.register_bookticker_callback(symbol, cb)
 
             # ===== DB → State ресинк активных ордеров раз в ~60с =====
             # Пересобираем список активных ордеров из БД и синхронизируем in-memory состояние
@@ -1302,15 +1449,15 @@ async def periodic_resource_check(telegram_id: int):
 
                 # Если активных ордеров больше нет — переводим в режим ожидания новой возможности
                 if not rebuilt_active_orders:
-                    try:
-                        pause_seconds = user.pause
-                    except Exception:
-                        pause_seconds = 0
+                    pause_seconds = _int(getattr(user, "pause", 0))
 
                     autobuy_states[telegram_id]["last_buy_price"] = None
+                    autobuy_states[telegram_id]["rise_buy_count"] = 0
                     autobuy_states[telegram_id]["waiting_for_opportunity"] = True
+                    # pause = 0 раньше давало restart_after = 0, а основной цикл
+                    # требует restart_after > 0 — бот замолкал навсегда.
                     autobuy_states[telegram_id]["restart_after"] = (
-                        time.time() + pause_seconds if pause_seconds > 0 else 0
+                        time.time() + pause_seconds
                     )
                     autobuy_states[telegram_id]["waiting_reported"] = False
                     logger.info(

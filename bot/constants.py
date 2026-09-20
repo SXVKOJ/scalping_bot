@@ -1,3 +1,5 @@
+import os
+
 from django.conf import settings
 
 
@@ -23,3 +25,26 @@ MONTHS_RU = {
 PAIR = settings.PAIR
 
 MAX_FAILS = 5 # Максимальное количество неудачных попыток до остановки мониторинга
+
+# ===== Настройки автобая (можно переопределить через переменные окружения) =====
+
+# Допустимая просадка mid-цены внутри окна анализа роста, в процентах.
+# 0 = прежнее поведение (любой тик вниз сбрасывает окно), что на реальном
+# рынке практически никогда не даёт покупку на росте.
+RISE_TREND_TOLERANCE_PCT = float(os.getenv("RISE_TREND_TOLERANCE_PCT", "0.05"))
+
+# Минимальный чистый рост к уровню триггера на момент покупки, в процентах.
+# 0 = достаточно любого превышения уровня (поведение по умолчанию).
+RISE_MIN_PCT = float(os.getenv("RISE_MIN_PCT", "0"))
+
+# Максимум покупок на росте в рамках одного цикла (до полного закрытия позиций).
+RISE_MAX_BUYS_PER_CYCLE = int(os.getenv("RISE_MAX_BUYS_PER_CYCLE", "3"))
+
+# Минимальный интервал между покупками на росте, сек.
+RISE_BUY_COOLDOWN_SEC = float(os.getenv("RISE_BUY_COOLDOWN_SEC", "3"))
+
+# Антидребезг для покупок на падении, сек.
+DROP_BUY_COOLDOWN_SEC = float(os.getenv("DROP_BUY_COOLDOWN_SEC", "10"))
+
+# Через сколько секунд повторить попытку покупки после ошибки.
+BUY_RETRY_DELAY_SEC = float(os.getenv("BUY_RETRY_DELAY_SEC", "30"))

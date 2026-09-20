@@ -5,7 +5,7 @@ from aiogram.filters import Command
 
 from bot.utils.mexc import get_user_client
 from bot.utils.websocket_manager import websocket_manager
-from bot.commands.autobuy import autobuy_states, trigger_states
+from bot.commands.autobuy import autobuy_states, trigger_states, arm_rise_trigger
 from bot.logger import logger
 import time
 
@@ -104,15 +104,8 @@ async def test_trigger_logic(message: Message):
         mid_price = (float(bookticker_data['bid_price']) + float(bookticker_data['ask_price'])) / 2
         current_time = time.time()
         
-        # Set trigger
-        state['trigger_price'] = mid_price
-        state['trigger_time'] = current_time
-        state['is_rise_trigger'] = True
-        state['is_trigger_activated'] = False
-        state['trigger_activated_time'] = 0
-        state['pause_trend_prices'] = []
-        state['trend_only_rise'] = True
-        state['last_pause_price'] = None
+        # Set trigger (через общий хелпер, чтобы состояние было полным)
+        arm_rise_trigger(state, mid_price, current_time)
         
         test_info = []
         test_info.append("🧪 *Trigger Test Results*\n")
