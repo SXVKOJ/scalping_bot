@@ -28,6 +28,7 @@ from bot.utils.log_cleaner import start_log_cleaner
 from bot.utils.websocket_manager import websocket_manager
 from bot.utils.autobuy_restart import restart_autobuy_for_users
 from bot.utils.reconciler import order_status_reconciler_loop
+from bot.utils.mexc_rest import rest_keepalive_loop
 from bot.utils.tg_session import create_bot, get_telegram_proxy
 from django.conf import settings
 
@@ -109,6 +110,10 @@ async def main():
         reconciler_task = asyncio.create_task(
             order_status_reconciler_loop(poll_interval_seconds=60)
         )
+
+        # Прогрев REST-соединения к MEXC: ордер не должен платить за
+        # TLS handshake в момент входа в сделку
+        rest_keepalive = asyncio.create_task(rest_keepalive_loop())
 
         # Инициализируем общее WebSocket соединение для мониторинга цен
         # Будем инициализировать его по требованию

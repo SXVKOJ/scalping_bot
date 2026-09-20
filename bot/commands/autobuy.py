@@ -6,6 +6,7 @@ from users.models import Deal, User
 from subscriptions.models import Subscription
 from bot.utils.user_autobuy_tasks import user_autobuy_tasks
 from bot.utils.mexc import handle_mexc_response
+from bot.utils.orders import execute_entry, place_take_profit
 from bot.utils.api_errors import parse_mexc_error
 from bot.utils.mexc_rest import MexcRestClient, to_mexc_symbol, split_pair
 from bot.logger import logger
@@ -84,6 +85,18 @@ def arm_rise_trigger(state: dict, ask_price: float, current_time: float) -> None
     state["pause_start_mid"] = None
     state["trend_only_rise"] = True
     state["last_pause_price"] = None
+
+
+def _set_autobuy_inactive(telegram_id: int) -> None:
+    """Гасит флаг автобая в памяти одновременно с записью в БД.
+
+    Обработчик тиков и process_buy сверяются с кешем, а не с БД, поэтому
+    флаг нужно сбрасывать сразу, иначе между остановкой и синхронизацией
+    кеша мог уйти лишний ордер.
+    """
+    state = autobuy_states.get(telegram_id)
+    if state is not None:
+        state["autobuy_active"] = False
 
 
 def schedule_buy_retry(telegram_id: int, why: str) -> None:
@@ -173,6 +186,7 @@ async def autobuy_loop(message: Message, telegram_id: int):
                     "cached_profit": None,  # Кеш настройки "профит" (%)
                     "cached_pause": 0,  # Кеш настройки "пауза" (сек)
                     "autobuy_active": True,  # Кеш флага автобая (без запроса в БД на тике)
+                    "cached_user": None,  # Кеш объекта пользователя (без БД на ордере)
                     "rest_client": None,  # Переиспользуемый REST-клиент (keep-alive)
                     "resource_task": None,  # Задача periodic_resource_check
                     "pause_peak_mid": None,  # Максимум mid внутри окна анализа роста
@@ -187,6 +201,7 @@ async def autobuy_loop(message: Message, telegram_id: int):
             autobuy_states[telegram_id]["cached_profit"] = _num(user.profit)
             autobuy_states[telegram_id]["cached_pause"] = _int(user.pause)
             autobuy_states[telegram_id]["autobuy_active"] = True
+            autobuy_states[telegram_id]["cached_user"] = user
             autobuy_states[telegram_id]["rest_client"] = rest
 
             # Восстанавливаем активные ордера из БД
@@ -417,6 +432,7 @@ async def autobuy_loop(message: Message, telegram_id: int):
                         st["cached_profit"] = _num(fresh.profit)
                         st["cached_pause"] = _int(fresh.pause)
                         st["autobuy_active"] = bool(fresh.autobuy)
+                        st["cached_user"] = fresh
                 except Exception as e:
                     logger.error(
                         f"Не удалось обновить кеш настроек для {telegram_id}: {e}"
@@ -428,7 +444,8 @@ async def autobuy_loop(message: Message, telegram_id: int):
                 )()
                 if not subscription or subscription.expires_at < timezone.now():
                     user.autobuy = False
-                    await sync_to_async(user.save)()
+                    _set_autobuy_inactive(telegram_id)
+                    await sync_to_async(user.save)(update_fields=["autobuy"])
                     task = user_autobuy_tasks.get(telegram_id)
                     if task:
                         task.cancel()
@@ -558,7 +575,8 @@ async def autobuy_loop(message: Message, telegram_id: int):
                 error_message = parse_mexc_error(e)
                 await message.answer(f"⛔ {error_message}\n\n  Автобай остановлен.")
                 user.autobuy = False
-                await sync_to_async(user.save)()
+                _set_autobuy_inactive(telegram_id)
+                await sync_to_async(user.save)(update_fields=["autobuy"])
                 task = user_autobuy_tasks.get(telegram_id)
                 if task:
                     task.cancel()
@@ -644,7 +662,8 @@ async def autobuy_loop(message: Message, telegram_id: int):
         )
         user = await sync_to_async(User.objects.get)(telegram_id=telegram_id)
         user.autobuy = False
-        await sync_to_async(user.save)()
+        _set_autobuy_inactive(telegram_id)
+        await sync_to_async(user.save)(update_fields=["autobuy"])
         task = user_autobuy_tasks.get(telegram_id)
         if task:
             task.cancel()
@@ -678,14 +697,22 @@ async def process_buy(
 
     logger.info(f"process_buy called for {telegram_id} with reason: {reason}")
 
-    # Получаем актуальные настройки пользователя из БД
-    user = await sync_to_async(User.objects.get)(telegram_id=telegram_id)
-
     # Глобальная защита на пользователя
     state = autobuy_states.get(telegram_id)
     if not state:
         logger.warning(f"No state for user {telegram_id} in process_buy")
         return
+
+    # Пользователя берём из кеша состояния: раньше здесь был запрос в БД
+    # прямо перед отправкой ордера — лишний поход в Postgres через thread
+    # pool в самом критичном по времени месте. Кеш обновляется основным
+    # циклом раз в 10с и periodic_resource_check раз в 60с.
+    cached_user = state.get("cached_user")
+    if cached_user is not None:
+        user = cached_user
+    else:
+        user = await sync_to_async(User.objects.get)(telegram_id=telegram_id)
+        state["cached_user"] = user
 
     lock = state.get("buy_lock")
     if lock is None:
@@ -706,11 +733,10 @@ async def process_buy(
     state["buy_in_progress"] = True
 
     try:
-        # Еще раз проверяем, что пользователь все еще в режиме автобай
-        user_active = await sync_to_async(
-            User.objects.filter(telegram_id=telegram_id, autobuy=True).exists
-        )()
-        if not user_active:
+        # Проверяем по кешу, что автобай всё ещё включён. Запрос в БД здесь
+        # стоял на критическом пути к ордеру; флаг синхронизируется с БД
+        # в фоновых циклах, а команда /stop сбрасывает его сразу.
+        if not state.get("autobuy_active", True):
             logger.info(
                 f"Отмена покупки - пользователь {telegram_id} больше не в режиме автобай"
             )
@@ -747,61 +773,58 @@ async def process_buy(
             # Логируем начало покупки
             logger.info(f"Начинаем покупку для {telegram_id}, причина: {reason}")
 
-            # Выполняем покупку
-            buy_order = await rest.new_order(
-                symbol, "BUY", "MARKET", {"quoteOrderQty": buy_amount}
-            )
-            handle_mexc_response(buy_order, "Покупка")
-            order_id = buy_order["orderId"]
+            # Выполняем покупку. Тип ордера и контроль проскальзывания —
+            # в bot/utils/orders.py, там же точность цены и количества по
+            # правилам биржи.
+            bookticker_now = websocket_manager.get_current_bookticker(symbol)
+            ask_now = None
+            if bookticker_now:
+                try:
+                    ask_now = float(bookticker_now["ask_price"])
+                except (TypeError, ValueError, KeyError):
+                    ask_now = None
+
+            entry = await execute_entry(rest, symbol, buy_amount, ask_price=ask_now)
 
             # Замер задержки: от срабатывания сигнала до исполнения BUY на бирже
             if trigger_ts is not None:
                 latency_ms = (time.perf_counter() - trigger_ts) * 1000
                 logger.info(
                     f"[Latency] {telegram_id} {reason}: сигнал → исполнение BUY "
-                    f"{latency_ms:.0f} мс"
+                    f"{latency_ms:.0f} мс ({entry.order_type})"
                 )
 
-            # Подтягиваем детали ордера
-            order_info = await rest.query_order(symbol, {"orderId": order_id})
-            logger.info(f"Детали ордера {order_id}: {order_info}")
+            if not entry.filled:
+                if entry.order_type == "ioc":
+                    # Не ошибка: цена ушла дальше допустимого проскальзывания.
+                    # Счётчик ошибок не трогаем, просто ждём следующий сигнал.
+                    logger.info(
+                        f"IOC-вход для {telegram_id} не исполнился, сигнал пропущен"
+                    )
+                    schedule_buy_retry(telegram_id, "IOC не исполнился")
+                    return
 
-            executed_qty = float(order_info.get("executedQty", 0))
-            if executed_qty == 0:
                 await message.answer("❗ Ошибка при создании ордера (executedQty=0).")
                 autobuy_states[telegram_id]["consecutive_errors"] = (
                     consecutive_errors + 1
                 )
                 if autobuy_states[telegram_id]["consecutive_errors"] >= 3:
                     user.autobuy = False
-                    await sync_to_async(user.save)()
+                    _set_autobuy_inactive(telegram_id)
+                    await sync_to_async(user.save)(update_fields=["autobuy"])
                     await message.answer(
                         "⛔ Автобай остановлен после 3 последовательных ошибок при создании ордеров."
                     )
                 else:
-                    schedule_buy_retry(telegram_id, "executedQty=0")
+                    schedule_buy_retry(telegram_id, "ордер не исполнился")
                 return
 
-            spent = float(order_info["cummulativeQuoteQty"])
-            if spent == 0:
-                await message.answer("❗ Ошибка при создании ордера (spent=0).")
-                autobuy_states[telegram_id]["consecutive_errors"] = (
-                    consecutive_errors + 1
-                )
-                if autobuy_states[telegram_id]["consecutive_errors"] >= 3:
-                    user.autobuy = False
-                    await sync_to_async(user.save)()
-                    await message.answer(
-                        "⛔ Автобай остановлен после 3 последовательных ошибок при создании ордеров."
-                    )
-                else:
-                    schedule_buy_retry(telegram_id, "spent=0")
-                return
+            executed_qty = entry.executed_qty
+            spent = entry.spent
+            real_price = entry.avg_price
 
             # Сбрасываем счетчик ошибок при успешной покупке
             autobuy_states[telegram_id]["consecutive_errors"] = 0
-
-            real_price = spent / executed_qty if executed_qty > 0 else 0
 
             # Сохраняем новую цену последней покупки сразу
             autobuy_states[telegram_id]["last_buy_price"] = real_price
@@ -811,28 +834,20 @@ async def process_buy(
                 f"Buy triggered for {telegram_id} because of {reason}. New last_buy_price: {real_price}"
             )
 
-            # Расчёт цены продажи - всегда используем актуальный профит из БД
-            user_settings = await sync_to_async(User.objects.get)(
-                telegram_id=telegram_id
+            # Профит берём из кеша настроек (обновляется раз в 10с),
+            # чтобы не ходить в БД между покупкой и защитным лимитом.
+            profit_percent = _num(
+                autobuy_states[telegram_id].get("cached_profit"), _num(user.profit)
             )
-            profit_percent = _num(user_settings.profit)
-            sell_price = round(real_price * (1 + profit_percent / 100), 6)
 
-            # Создание лимитного ордера на продажу
-            sell_order = await rest.new_order(
-                symbol,
-                "SELL",
-                "LIMIT",
-                {
-                    "quantity": executed_qty,
-                    "price": f"{sell_price:.6f}",
-                    "timeInForce": "GTC",
-                },
+            take_profit = await place_take_profit(
+                rest, symbol, executed_qty, real_price, profit_percent
             )
-            handle_mexc_response(sell_order, "Продажа")
-            sell_order_id = sell_order["orderId"]
+            sell_order_id = take_profit["order_id"]
+            sell_price = take_profit["price"]
+            sell_qty = take_profit["quantity"]
             logger.info(
-                f"SELL ордер {sell_order_id} выставлен на {sell_price:.6f} {quote_asset}"
+                f"SELL ордер {sell_order_id} выставлен на {sell_price} {quote_asset}"
             )
 
             # Сохраняем ордер в базу
@@ -845,7 +860,7 @@ async def process_buy(
                 user_order_number=user_order_number,
                 symbol=symbol,
                 buy_price=real_price,
-                quantity=executed_qty,
+                quantity=sell_qty,
                 sell_price=sell_price,
                 status="NEW",
                 is_autobuy=True,
@@ -956,7 +971,8 @@ async def process_buy(
             # Если достигли 3 последовательных ошибки, останавливаем автобай
             if autobuy_states[telegram_id]["consecutive_errors"] >= 3:
                 user.autobuy = False
-                await sync_to_async(user.save)()
+                _set_autobuy_inactive(telegram_id)
+                await sync_to_async(user.save)(update_fields=["autobuy"])
                 await message.answer(
                     "⛔ Автобай остановлен после 3 последовательных ошибок. Проверьте настройки и баланс."
                 )
@@ -1378,6 +1394,7 @@ async def periodic_resource_check(telegram_id: int):
                 st["cached_profit"] = _num(user.profit)
                 st["cached_pause"] = _int(user.pause)
                 st["autobuy_active"] = bool(user.autobuy)
+                st["cached_user"] = user
 
             if not websocket_manager.market_connection:
                 logger.warning(

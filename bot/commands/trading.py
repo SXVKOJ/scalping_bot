@@ -15,6 +15,7 @@ from asgiref.sync import sync_to_async
 from bot.utils.mexc_rest import MexcRestClient, split_pair, to_mexc_symbol
 from django.utils.timezone import localtime
 from bot.utils.mexc import handle_mexc_response
+from bot.utils.orders import execute_entry, place_take_profit
 from bot.utils.api_errors import parse_mexc_error
 from bot.utils.bot_logging import log_command
 import math
@@ -241,67 +242,46 @@ async def buy_handler(message: Message):
             await message.answer(response_text)
             return
 
-        symbol = user.pair.replace("/", "")
+        symbol = to_mexc_symbol(user.pair)
+        base_asset, quote_asset = split_pair(user.pair)
         extra_data["symbol"] = symbol
         rest = MexcRestClient(api_key=user.api_key, api_secret=user.api_secret)
         buy_amount = float(user.buy_amount)
         extra_data["buy_amount"] = buy_amount
 
-        # 1. Создаём ордер
-        buy_order = await rest.new_order(
-            symbol, "BUY", "MARKET", {"quoteOrderQty": buy_amount}
-        )
-        handle_mexc_response(buy_order, "Покупка через /buy")
+        # 1-3. Покупка через общий модуль: точность цены/количества по
+        # правилам биржи, контроль проскальзывания, защита от дублей.
+        entry = await execute_entry(rest, symbol, buy_amount)
 
-        order_id = buy_order["orderId"]
+        order_id = entry.order_id
         extra_data["buy_order_id"] = order_id
 
-        # 2. Подтягиваем детали через query_order
-        order_info = await rest.query_order(symbol, {"orderId": order_id})
-        logger.info(f"Детали ордера {order_id}: {order_info}")
-
-        # 3. Получаем количество и среднюю цену
-        executed_qty = float(order_info.get("executedQty", 0))
-        if executed_qty == 0:
-            response_text = "❗ Ошибка при создании ордера (executedQty=0)."
+        if not entry.filled:
+            response_text = "❗ Ордер не исполнился (executedQty=0)."
             success = False
             await message.answer(response_text)
             return
 
-        spent = float(order_info["cummulativeQuoteQty"])
-        if spent == 0:
-            response_text = "❗ Ошибка при создании ордера (spent=0)."
-            success = False
-            await message.answer(response_text)
-            return
-
-        real_price = spent / executed_qty if executed_qty > 0 else 0
+        executed_qty = entry.executed_qty
+        spent = entry.spent
+        real_price = entry.avg_price
         extra_data["real_price"] = real_price
         extra_data["executed_qty"] = executed_qty
         extra_data["spent"] = spent
 
-        # 4. Считаем цену продажи
+        # 4-5. Лимит на продажу
         profit_percent = float(user.profit)
-        sell_price = round(real_price * (1 + profit_percent / 100), 6)
+        take_profit = await place_take_profit(
+            rest, symbol, executed_qty, real_price, profit_percent
+        )
+        sell_order_id = take_profit["order_id"]
+        sell_price = take_profit["price"]
+        sell_qty = take_profit["quantity"]
+        extra_data["sell_order_id"] = sell_order_id
         extra_data["sell_price"] = sell_price
         extra_data["profit_percent"] = profit_percent
-
-        # 5. Выставляем лимитный SELL ордер
-        sell_order = await rest.new_order(
-            symbol,
-            "SELL",
-            "LIMIT",
-            {
-                "quantity": executed_qty,
-                "price": f"{sell_price:.6f}",
-                "timeInForce": "GTC",
-            },
-        )
-        handle_mexc_response(sell_order, "Продажа")
-        sell_order_id = sell_order["orderId"]
-        extra_data["sell_order_id"] = sell_order_id
         logger.info(
-            f"SELL ордер {sell_order_id} выставлен на {sell_price:.6f} {symbol[3:]}"
+            f"SELL ордер {sell_order_id} выставлен на {sell_price} {quote_asset}"
         )
 
         # 6. Сохраняем ордер в базу
@@ -317,7 +297,7 @@ async def buy_handler(message: Message):
             user_order_number=user_order_number,
             symbol=symbol,
             buy_price=real_price,
-            quantity=executed_qty,
+            quantity=sell_qty,
             sell_price=sell_price,
             status="NEW",
         )
@@ -337,10 +317,10 @@ async def buy_handler(message: Message):
         # 7. Отправляем ответ
         response_text = (
             f"🟢 *СДЕЛКА {user_order_number} ОТКРЫТА*\n\n"
-            f"📉 Куплено по: `{real_price:.6f}` {symbol[3:]}\n"
-            f"📦 Кол-во: `{executed_qty:.6f}` {symbol[:3]}\n"
-            f"💸 Потрачено: `{spent:.2f}` {symbol[3:]}\n\n"
-            f"📈 Лимит на продажу: `{sell_price:.6f}` {symbol[3:]}"
+            f"📉 Куплено по: `{real_price:.6f}` {quote_asset}\n"
+            f"📦 Кол-во: `{executed_qty:.6f}` {base_asset}\n"
+            f"💸 Потрачено: `{spent:.2f}` {quote_asset}\n\n"
+            f"📈 Лимит на продажу: `{sell_price}` {quote_asset}"
         )
         await message.answer(response_text, parse_mode="Markdown")
 
@@ -390,7 +370,7 @@ async def autobuy_handler(message: Message):
             return
 
         user.autobuy = True
-        await sync_to_async(user.save)()
+        await sync_to_async(user.save)(update_fields=["autobuy"])
 
         # В конце успешного выполнения:
         response_text = "🟢 Автобай запущен"
@@ -431,6 +411,18 @@ async def stop_autobuy(message: Message):
     try:
         telegram_id = message.from_user.id
 
+        # Сбрасываем флаг в памяти ПЕРВЫМ делом: обработчик тиков и
+        # process_buy сверяются именно с ним, чтобы не ходить в БД на
+        # критическом пути. Без этого между /stop и синхронизацией кеша
+        # мог успеть уйти ещё один ордер.
+        try:
+            from bot.commands.autobuy import autobuy_states
+
+            if telegram_id in autobuy_states:
+                autobuy_states[telegram_id]["autobuy_active"] = False
+        except Exception as e:
+            logger.error(f"Не удалось сбросить флаг автобая в памяти: {e}")
+
         # Если есть задача для пользователя, отменяем её
         if (
             telegram_id in user_autobuy_tasks
@@ -442,7 +434,7 @@ async def stop_autobuy(message: Message):
         # Меняем статус в базе
         user = await sync_to_async(User.objects.get)(telegram_id=telegram_id)
         user.autobuy = False
-        await sync_to_async(user.save)()
+        await sync_to_async(user.save)(update_fields=["autobuy"])
 
         response_text = "🔴 Автобай остановлен"
         await message.answer(response_text)

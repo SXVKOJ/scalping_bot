@@ -48,3 +48,17 @@ DROP_BUY_COOLDOWN_SEC = float(os.getenv("DROP_BUY_COOLDOWN_SEC", "10"))
 
 # Через сколько секунд повторить попытку покупки после ошибки.
 BUY_RETRY_DELAY_SEC = float(os.getenv("BUY_RETRY_DELAY_SEC", "30"))
+
+# ===== Исполнение ордеров =====
+
+# Тип ордера на вход: "market" (как было) или "ioc" — лимит по ask с запасом
+# ENTRY_MAX_SLIPPAGE_PCT, остаток отменяется. IOC ограничивает худшую цену
+# исполнения, но часть сигналов может остаться без входа.
+ENTRY_ORDER_TYPE = (os.getenv("ENTRY_ORDER_TYPE", "market") or "market").strip().lower()
+
+# Максимальное проскальзывание для IOC-входа, %.
+ENTRY_MAX_SLIPPAGE_PCT = float(os.getenv("ENTRY_MAX_SLIPPAGE_PCT", "0.3"))
+
+# Надбавка к профиту на комиссии, %. 0 = профит считается «грязным», как было.
+# У MEXC спот taker 0.05%, maker 0% — для «чистого» профита ставьте 0.05.
+PROFIT_FEE_BUFFER_PCT = float(os.getenv("PROFIT_FEE_BUFFER_PCT", "0"))

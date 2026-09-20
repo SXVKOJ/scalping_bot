@@ -3,6 +3,7 @@ import aiohttp
 import hmac
 import hashlib
 import time
+import uuid
 from typing import Dict, Any, Optional
 from urllib.parse import urlencode, quote
 
@@ -47,6 +48,30 @@ async def close_shared_session() -> None:
 
 
 
+async def rest_keepalive_loop(interval_sec: int = 20) -> None:
+    """Держит TCP/TLS-соединение к MEXC горячим.
+
+    keepalive_timeout у пула — 60с, но MEXC/Cloudflare закрывают простаивающие
+    соединения раньше. Без прогрева первый ордер после паузы платит полный
+    TCP+TLS handshake — десятки миллисекунд прямо в момент входа в сделку.
+    """
+    from bot.logger import logger
+
+    while True:
+        try:
+            session = await get_shared_session()
+            async with session.get(
+                f"{MexcRestClient.BASE_URL}/api/v3/ping",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                await resp.read()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"[REST] keep-alive ping не прошёл: {e}")
+        await asyncio.sleep(interval_sec)
+
+
 def to_mexc_symbol(pair: str) -> str:
     return (pair or "").replace("/", "").replace("-", "").replace("_", "").upper().strip()
 
@@ -77,6 +102,7 @@ class MexcRestClient:
         self._time_offset_ms: Optional[int] = None
         self._last_time_sync: float = 0.0
         self._time_sync_interval_sec: int = 300
+        self._time_sync_task: Optional[asyncio.Task] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Возвращает общую keep-alive сессию процесса."""
@@ -101,16 +127,31 @@ class MexcRestClient:
             # Fallback to local timestamp on timeout/network errors
             return int(time.time() * 1000)
 
-    async def _ensure_time_offset(self) -> None:
+    async def _sync_time(self) -> None:
         now = time.time()
-        if (
-            self._time_offset_ms is None
-            or (now - self._last_time_sync) > self._time_sync_interval_sec
-        ):
-            server_ms = await self._server_time()
-            local_ms = int(now * 1000)
-            self._time_offset_ms = server_ms - local_ms
-            self._last_time_sync = now
+        server_ms = await self._server_time()
+        self._time_offset_ms = server_ms - int(now * 1000)
+        self._last_time_sync = now
+
+    async def _ensure_time_offset(self) -> None:
+        """Держит смещение часов свежим, НЕ задерживая текущий запрос.
+
+        Раньше устаревший офсет означал лишний HTTP-круг к /api/v3/time прямо
+        перед отправкой ордера — десятки миллисекунд проскальзывания раз в
+        5 минут. Теперь первый запрос синхронизируется честно, а дальше
+        обновление уходит в фон: recvWindow с запасом перекрывает дрейф часов.
+        """
+        now = time.time()
+        if self._time_offset_ms is None:
+            # Офсета нет вообще — без него подпись не пройдёт.
+            await self._sync_time()
+            return
+
+        if (now - self._last_time_sync) > self._time_sync_interval_sec:
+            if self._time_sync_task is None or self._time_sync_task.done():
+                # Помечаем сразу, чтобы фоновых задач не наплодилось.
+                self._last_time_sync = now
+                self._time_sync_task = asyncio.create_task(self._sync_time())
 
     async def _request(
         self,
@@ -120,6 +161,7 @@ class MexcRestClient:
         signed: bool = False,
         timeout_sec: int = 20,
         recv_window_ms: int = 59000,
+        retries: Optional[int] = None,
     ) -> Dict[str, Any]:
         params = params.copy() if params else {}
         headers = {}
@@ -158,7 +200,10 @@ class MexcRestClient:
         url = f"{self.BASE_URL}{path}"
         timeout = aiohttp.ClientTimeout(total=timeout_sec)
         session = await self._get_session()
-        max_retries = 3
+        # POST /api/v3/order неидемпотентен: повтор после таймаута мог создать
+        # вторую рыночную покупку, если биржа приняла первую, а ответ не дошёл.
+        # По умолчанию повторяем только GET.
+        max_retries = retries if retries is not None else (3 if method == "GET" else 1)
         backoff = 0.5
         last_err = None
         for _ in range(max_retries):
@@ -231,6 +276,22 @@ class MexcRestClient:
             timeout_sec=10,
         )
 
+    async def exchange_info(self, symbol: str) -> Dict[str, Any]:
+        """Торговые правила символа (точность, минимумы, комиссии)."""
+        return await self._request(
+            "GET",
+            "/api/v3/exchangeInfo",
+            {"symbol": to_mexc_symbol(symbol)},
+            signed=False,
+            timeout_sec=15,
+        )
+
+    async def ping(self) -> Dict[str, Any]:
+        """Лёгкий запрос, держит TCP/TLS-соединение горячим."""
+        return await self._request(
+            "GET", "/api/v3/ping", {}, signed=False, timeout_sec=5, retries=1
+        )
+
     # Signed
     async def account_info(self) -> Dict[str, Any]:
         return await self._request(
@@ -243,14 +304,47 @@ class MexcRestClient:
             "GET", "/api/v3/openOrders", {"symbol": symbol}, signed=True, timeout_sec=20
         )
 
+    # Ордер, подписанный больше чем на несколько секунд назад, для скальпинга
+    # бесполезен: исполнится по цене, к сигналу уже не относящейся.
+    ORDER_RECV_WINDOW_MS = 5000
+    ORDER_TIMEOUT_SEC = 10
+
+    @staticmethod
+    def make_client_order_id(prefix: str = "sb") -> str:
+        """Идемпотентный ключ ордера: повтор с тем же ключом биржа отклонит."""
+        return f"{prefix}{uuid.uuid4().hex[:24]}"
+
     async def new_order(
         self, symbol: str, side: str, order_type: str, options: Dict[str, Any]
     ) -> Dict[str, Any]:
         params = {"symbol": to_mexc_symbol(symbol), "side": side, "type": order_type}
         params.update(options or {})
+        # Клиентский ID позволяет после сетевой ошибки выяснить, был ли ордер
+        # на самом деле создан, вместо слепого повтора.
+        params.setdefault("newClientOrderId", self.make_client_order_id())
         return await self._request(
-            "POST", "/api/v3/order", params, signed=True, timeout_sec=25
+            "POST",
+            "/api/v3/order",
+            params,
+            signed=True,
+            timeout_sec=self.ORDER_TIMEOUT_SEC,
+            recv_window_ms=self.ORDER_RECV_WINDOW_MS,
         )
+
+    async def find_order_by_client_id(
+        self, symbol: str, client_order_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Ищет ордер по клиентскому ID. None — биржа его не создавала.
+
+        Нужно после сетевого сбоя на POST /order: повторять ордер вслепую
+        нельзя, но и бросать позицию без лимита на продажу тоже.
+        """
+        try:
+            return await self.query_order(
+                symbol, {"origClientOrderId": client_order_id}
+            )
+        except Exception:
+            return None
 
     async def query_order(self, symbol: str, options: Dict[str, Any]) -> Dict[str, Any]:
         params = {"symbol": to_mexc_symbol(symbol)}
