@@ -37,7 +37,7 @@ class User(models.Model):
 
 class Deal(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
-    order_id = models.CharField(max_length=64)
+    order_id = models.CharField(max_length=64, db_index=True)
     user_order_number = models.PositiveIntegerField(null=True, blank=True)
     symbol = models.CharField(max_length=20)
     buy_price = models.DecimalField(max_digits=20, decimal_places=8)  # Стоимость покупки
@@ -47,6 +47,14 @@ class Deal(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     is_autobuy = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["user", "status", "is_autobuy"],
+                name="users_deal_user_status_idx",
+            ),
+        ]
 
     def __str__(self):
         return f"Order ID: {self.order_id}, Symbol: {self.symbol}, Buy Price: {self.buy_price}, Sell Price: {self.sell_price}, Quantity: {self.quantity}, Status: {self.status}"

@@ -209,17 +209,28 @@ def save_user_parameter(user_id: int, param: str, value: float):
     try:
         user = User.objects.get(telegram_id=user_id)
         setattr(user, param, value)
-        user.save()
+        # Точечное сохранение: автобай параллельно может писать флаг autobuy,
+        # полный save() затёр бы его устаревшим значением.
+        user.save(update_fields=[param])
         logger.info(f"[OK] Saved {param}={value} for user {user_id}")
-        
-        # Если пользователь в режиме автобая, обновляем параметры в реальном времени
-        if hasattr(user, 'autobuy') and user.autobuy:
-            # Импортируем autobuy_states здесь, чтобы избежать циклических импортов
-            from bot.commands.autobuy import autobuy_states
-            if user_id in autobuy_states:
-                logger.info(f"[OK] Updated {param} in autobuy_states for user {user_id}")
-                # В зависимости от параметра, можем выполнить дополнительные действия
-                # Например, сбросить некоторые флаги или пересчитать величины
+
+        # Обновляем кеш автобая сразу. Раньше здесь был только лог — новое
+        # значение доезжало до торговой логики лишь на следующей
+        # синхронизации (до 10с), а с кешированием объекта пользователя
+        # могло и вовсе не примениться к текущему циклу.
+        from bot.commands.autobuy import autobuy_states
+
+        state = autobuy_states.get(user_id)
+        if state is not None:
+            cache_field = {
+                "profit": "cached_profit",
+                "loss": "cached_loss",
+                "pause": "cached_pause",
+            }.get(param)
+            if cache_field:
+                state[cache_field] = int(value) if param == "pause" else float(value)
+            state["cached_user"] = user
+            logger.info(f"[OK] Updated {param} in autobuy_states for user {user_id}")
     except User.DoesNotExist:
         logger.error(f"❌ Cannot save {param} — user {user_id} not found")
     except Exception as e:
