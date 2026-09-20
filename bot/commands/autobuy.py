@@ -23,7 +23,6 @@ from bot.constants import (
 import json
 import time
 import weakref
-import gc
 
 # Словарь для хранения состояния autobuy для каждого пользователя
 autobuy_states = {}  # {user_id: {'last_buy_price': float, 'active_orders': [], etc.}}
@@ -1341,20 +1340,13 @@ async def periodic_resource_check(telegram_id: int):
     """Периодическая проверка и очистка ресурсов + ресинк состояния из БД"""
     while telegram_id in autobuy_states:
         try:
-            # Вызываем сборщик мусора
-            gc.collect()
-
-            # Журналируем статистику о количестве клиентских сессий
-            client_session_count = 0
-            for obj in gc.get_objects():
-                if "ClientSession" in str(type(obj)):
-                    client_session_count += 1
-
-            # Учитываем только открытые сессии; повышаем порог для предупреждения
-            if client_session_count > 20:
-                logger.warning(
-                    f"Обнаружено {client_session_count} клиентских сессий. Рекомендуется проверить утечку ресурсов."
-                )
+            # Раньше здесь каждые 60с на каждого пользователя вызывался
+            # сборщик мусора и полный обход кучи (gc.get_objects) ради
+            # подсчёта ClientSession. Обход кучи блокирует event loop на
+            # сотни миллисекунд: тик, пришедший в этот момент, обрабатывался
+            # с задержкой, а ордер уходил по худшей цене. Счётчик больше не
+            # нужен — транспорт общий (одна keep-alive сессия на процесс), а
+            # утечки соединений видны через get_connection_stats().
 
             # Проверяем состояние ожидания и обновляем его при необходимости
             current_time = time.time()

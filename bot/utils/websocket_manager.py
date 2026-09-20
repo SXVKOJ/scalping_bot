@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 import logging
 import aiohttp
@@ -27,6 +28,10 @@ class MexcWebSocketManager:
 
     BASE_URL = "wss://wbs-api.mexc.com/ws"
     REST_API_URL = "https://api.mexc.com"
+
+    # Сколько секунд тишины в market-потоке считаем обрывом связи.
+    # Пинги идут раз в 30с и ответы PONG тоже считаются сообщениями.
+    MARKET_SILENCE_TIMEOUT = float(os.getenv("MARKET_SILENCE_TIMEOUT_SEC", "90"))
 
     def __init__(self):
         self.user_connections: Dict[int, Dict] = {}  # {user_id: {'ws': websocket, 'listen_key': key}}
@@ -381,6 +386,7 @@ class MexcWebSocketManager:
                     'session': session,
                     'created_at': time.time(),
                     'last_ping': time.time(),
+                    'last_message_at': time.time(),
                     'reconnect_count': 0
                 }
                 logger.debug("[MarketWS] Market connection object created")
@@ -686,6 +692,26 @@ class MexcWebSocketManager:
                             await asyncio.sleep(60)
                             market_failure_count = 0
 
+                    # Данные не идут, хотя сокет открыт (half-open TCP).
+                    # Для bookTicker ликвидной пары тишина в минуту означает
+                    # мёртвое соединение: без этой проверки бот молча
+                    # переставал видеть цены и не покупал.
+                    elif (
+                        current_time
+                        - self.market_connection.get(
+                            'last_message_at', market_created
+                        )
+                    ) > self.MARKET_SILENCE_TIMEOUT:
+                        silence = current_time - self.market_connection.get(
+                            'last_message_at', market_created
+                        )
+                        logger.warning(
+                            f"Market WebSocket silent for {silence:.0f}s, reconnecting..."
+                        )
+                        await self.disconnect_market()
+                        await asyncio.sleep(2)
+                        await self.connect_market_data()
+
                     # Проверяем возраст соединения (30 минут)
                     elif current_time - market_created > 1800:
                         logger.info("Market connection is stale, reconnecting...")
@@ -693,8 +719,10 @@ class MexcWebSocketManager:
                         await asyncio.sleep(2)
                         await self.connect_market_data()
 
-                elif self.market_subscriptions:
-                    # Если есть подписки, но нет соединения - пробуем переподключиться
+                elif self.market_subscriptions or self.bookticker_subscriptions:
+                    # Если есть подписки, но нет соединения - пробуем переподключиться.
+                    # Автобай подписывается только на bookTicker, поэтому проверять
+                    # одни market_subscriptions недостаточно.
                     logger.info("No market connection but have subscriptions, reconnecting...")
                     if market_failure_count < max_failures:
                         success = await self.connect_market_data()

@@ -121,6 +121,12 @@ async def listen_market_messages_impl(manager: Any):
         while not manager.is_shutting_down and manager.market_connection and not ws.closed:
             try:
                 msg = await ws.receive(timeout=60)
+                # Отметка живости: по ней monitor_connections ловит
+                # "немые" соединения (TCP жив, данные не идут).
+                try:
+                    manager.market_connection["last_message_at"] = time.time()
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
                 connection_age = time.time() - manager.market_connection.get('created_at', time.time())
                 logger.debug(f"[MarketWS] Timeout after {connection_age:.1f}s - no messages from MEXC for 60 seconds")
