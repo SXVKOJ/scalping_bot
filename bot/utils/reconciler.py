@@ -1,89 +1,53 @@
 import asyncio
 import time
-from typing import Dict, List
+from typing import List
 
 from asgiref.sync import sync_to_async
 from bot.logger import logger
 from users.models import User, Deal
-from bot.utils.mexc_rest import MexcRestClient
+from bot.utils.exchange import client_for_user
+from django.conf import settings
 from bot.utils.websocket_handlers import update_order_status
 
 
 async def _reconcile_user_orders(user: User) -> None:
     """Reconcile one user's active orders against REST API and update DB."""
     try:
-        # Skip if no pair configured
-        if not user.pair:
-            return
-
         # Collect active deals from DB
         active_deals: List[Deal] = await sync_to_async(list)(
-            Deal.objects.filter(
+            Deal.objects.filter(exchange=settings.EXCHANGE,
                 user=user, status__in=["NEW", "PARTIALLY_FILLED"]
             ).order_by("-created_at")
         )
         if not active_deals:
             return
 
-        # Fetch open orders from REST for the configured pair (async client with time sync and recvWindow)
-        try:
-            client = MexcRestClient(user.api_key, user.api_secret)
-            symbol = (user.pair or "").replace("/", "")
-            # Primary attempt
-            open_orders = await client.open_orders(symbol)
-        except Exception as e:
-            # Retry once using local timestamp by forcing zero offset (avoid /api/v3/time dependency)
+        client = client_for_user(user, allow_hold=True)
+        # Restored orders may use a different pair from the current strategy.
+        for symbol in {deal.symbol for deal in active_deals}:
             try:
-                setattr(client, "_time_offset_ms", 0)
-                setattr(client, "_last_time_sync", time.time())
                 open_orders = await client.open_orders(symbol)
-            except Exception as e2:
-                logger.warning(
-                    f"[Reconciler] open_orders failed for user {user.telegram_id}: {e2}"
-                )
-                # При ошибке не мутируем БД; пусть следующая итерация или WS восстановит состояние
+            except Exception as exc:
+                logger.warning(f"[Reconciler] open_orders failed for {symbol}: {exc}")
                 open_orders = []
 
-        # Map and update
-        deals_by_id: Dict[str, Deal] = {d.order_id: d for d in active_deals}
-        api_by_id: Dict[str, Dict] = {
-            str(o.get("orderId")): o for o in open_orders if o.get("orderId")
-        }
+            # Map and update
+            deals_by_id = {d.order_id: d for d in active_deals if d.symbol == symbol}
+            api_by_id = {str(o['orderId']): o for o in open_orders if o.get('orderId')}
 
-        # First, update deals that are present in open_orders (centralized updater with notifications)
-        for order_id, order in api_by_id.items():
-            if order_id in deals_by_id:
-                current_status = order.get("status")
-                if current_status:
-                    await update_order_status(
-                        order_id, symbol, current_status, user_id=user.telegram_id
-                    )
+            # First update orders present in open_orders.
+            for order_id, order in api_by_id.items():
+                if order_id in deals_by_id and order.get('status'):
+                    await update_order_status(order_id, symbol, order['status'], user_id=user.telegram_id)
 
-        # Then, for DB-active deals that are missing in open_orders, confirm status via query_order (centralized updater)
-        for order_id, deal in deals_by_id.items():
-            if order_id not in api_by_id:
+            # Confirm missing orders individually; an API error never changes DB status.
+            for order_id in deals_by_id.keys() - api_by_id.keys():
                 try:
-                    resp = await client.query_order(symbol, {"orderId": order_id})
-                    api_status = resp.get("status")
-                    if api_status:
-                        await update_order_status(
-                            order_id, symbol, api_status, user_id=user.telegram_id
-                        )
-                except Exception as e:
-                    # Retry once with local timestamp fallback
-                    try:
-                        setattr(client, "_time_offset_ms", 0)
-                        setattr(client, "_last_time_sync", time.time())
-                        resp = await client.query_order(symbol, {"orderId": order_id})
-                        api_status = resp.get("status")
-                        if api_status:
-                            await update_order_status(
-                                order_id, symbol, api_status, user_id=user.telegram_id
-                            )
-                    except Exception as e2:
-                        logger.warning(
-                            f"[Reconciler] query_order failed for {order_id} (user {user.telegram_id}): {e2}"
-                        )
+                    resp = await client.query_order(symbol, {'orderId': order_id})
+                    if resp.get('status'):
+                        await update_order_status(order_id, symbol, resp['status'], user_id=user.telegram_id)
+                except Exception as exc:
+                    logger.warning(f"[Reconciler] query_order failed for {order_id}: {exc}")
 
     except Exception as e:
         logger.error(
@@ -102,7 +66,7 @@ async def order_status_reconciler_loop(poll_interval_seconds: int = 60) -> None:
         start_ts = time.time()
         try:
             users = await sync_to_async(list)(
-                User.objects.exclude(api_key__isnull=True)
+                User.objects.filter(api_exchange=settings.EXCHANGE).exclude(api_key__isnull=True)
                 .exclude(api_key="")
                 .exclude(api_secret__isnull=True)
                 .exclude(api_secret="")

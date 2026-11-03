@@ -83,7 +83,7 @@ async def debug_websocket_connection(message: Message):
 
         # Test REST API for comparison
         try:
-            ticker = client.book_ticker(pair)
+            ticker = await client.book_ticker(pair)
             rest_bid = ticker.get("bidPrice", "N/A")
             rest_ask = ticker.get("askPrice", "N/A")
             debug_info.append(f"\n📡 *REST API Test:*")

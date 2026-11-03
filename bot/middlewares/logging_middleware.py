@@ -18,12 +18,15 @@ class LoggingMiddleware(BaseMiddleware):
         event: Message | CallbackQuery,
         data: Dict[str, Any]
     ) -> Any:
+        state = data.get('state')
+        if state and await state.get_state() in ('APIAuth:waiting_for_api_key', 'APIAuth:waiting_for_api_secret'):
+            return await handler(event, data)
         # Логируем взаимодействие до вызова обработчика
         if isinstance(event, Message):
             # Обработка текстовых сообщений
             user_id = event.from_user.id
             username = event.from_user.username or event.from_user.first_name or 'Unknown'
-            
+
             if event.text:
                 # Для команд просто логируем в консоль, детальное логирование будет в обработчиках
                 if COMMAND_PATTERN.match(event.text):
@@ -53,15 +56,15 @@ class LoggingMiddleware(BaseMiddleware):
                         'message_type': event.content_type
                     }
                 )
-        
+
         elif isinstance(event, CallbackQuery):
             # Обработка нажатий на кнопки - только логируем в консоль
             # Полное логирование будет происходить в обработчиках callback
             user_id = event.from_user.id
             callback_data = event.data
-            
+
             # Только логируем в консоль, без создания записи в БД
             logger.info(f"User {user_id} pressed button: {callback_data}")
-        
+
         # Вызываем обработчик события
-        return await handler(event, data) 
+        return await handler(event, data)

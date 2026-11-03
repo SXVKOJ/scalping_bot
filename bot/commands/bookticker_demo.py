@@ -29,7 +29,7 @@ async def get_spread_info(message: Message):
 
         # Get initial REST API data for comparison
         try:
-            ticker = client.book_ticker(pair)
+            ticker = await client.book_ticker(pair)
             rest_bid = ticker.get('bidPrice', 'N/A')
             rest_ask = ticker.get('askPrice', 'N/A')
         except Exception as e:
@@ -169,4 +169,4 @@ async def show_bookticker_status(message: Message):
         
     except Exception as e:
         logger.exception(f"Error in bookticker status command: {e}")
-        await message.answer(f"❌ Ошибка получения статуса: {str(e)}") 
+        await message.answer(f"❌ Ошибка получения статуса: {str(e)}")

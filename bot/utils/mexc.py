@@ -12,7 +12,7 @@ from bot.utils.mexc_rest import MexcRestClient
 async def get_actual_order_status_async(user: User, symbol: str, order_id: str) -> str:
     """Async function to get order status using MexcRestClient."""
     try:
-        client = MexcRestClient(user.api_key, user.api_secret)
+        client = client_for_user(user, allow_hold=True)
         response = await client.query_order(symbol, {"orderId": order_id})
         if not isinstance(response, dict):
             logger.error(
@@ -29,107 +29,24 @@ async def get_actual_order_status_async(user: User, symbol: str, order_id: str) 
         return None
 
 
-# Синхронная версия для обратной совместимости
-def check_mexc_keys(api_key: str, api_secret: str) -> tuple:
-    url = "https://api.mexc.com/api/v3/account"
-    timestamp = int(time.time() * 1000)
-
-    query_string = f"timestamp={timestamp}"
-    signature = hmac.new(
-        api_secret.encode(), query_string.encode(), hashlib.sha256
-    ).hexdigest()
-
-    headers = {"X-MEXC-APIKEY": api_key}
-
-    response = requests.get(
-        f"{url}?{query_string}&signature={signature}", headers=headers
-    )
-
-    logger.info(
-        f"Response status code: {response.status_code}, response text: {response.text}"
-    )
-    # Проверяем, что статус код 200 (успех)
-    error = ""
-    if response.status_code != 200:
-        error = parse_mexc_error(response.text)
-
-    return response.status_code == 200, error
+# Legacy module path retained for existing command imports.
+from bot.utils.exchange import client_for_user, ExchangeClient
 
 
-# Новая асинхронная версия
-async def check_mexc_keys_async(api_key: str, api_secret: str) -> tuple:
-    url = "https://api.mexc.com/api/v3/account"
-    timestamp = int(time.time() * 1000)
-
-    query_string = f"timestamp={timestamp}"
-    signature = hmac.new(
-        api_secret.encode(), query_string.encode(), hashlib.sha256
-    ).hexdigest()
-
-    headers = {"X-MEXC-APIKEY": api_key}
-
+async def check_mexc_keys_async(api_key, api_secret):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{url}?{query_string}&signature={signature}", headers=headers
-            ) as response:
-                status_code = response.status
-                response_text = await response.text()
-                logger.info(
-                    f"Response status code: {status_code}, response text: {response_text}"
-                )
-
-                # Проверяем наличие ошибок
-                if status_code != 200:
-                    # Обработка ошибки IP whitelist
-                    if (
-                        "700006" in response_text
-                        and "ip white list" in response_text.lower()
-                    ):
-                        error_msg = "IP адрес вашего сервера не добавлен в белый список. Пожалуйста, откройте настройки API ключа на MEXC и добавьте IP ограничения, либо уберите ограничения по IP."
-                        logger.warning(f"IP не в белом списке: {response_text}")
-                        return False, error_msg
-
-                    # Другие ошибки
-                    error = parse_mexc_error(response_text)
-                    return False, error
-
-                # Если статус 200, ключи валидны
-                return True, ""
-    except Exception as e:
-        logger.error(f"Ошибка при проверке ключей API: {e}")
-        return False, f"Ошибка соединения: {str(e)}"
+        await ExchangeClient(api_key, api_secret).account_info()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
 
 
-# Функция для получения клиента и валютной пары
-def get_user_client(telegram_id: int):
-    try:
-        user = User.objects.get(telegram_id=telegram_id)
-
-        # Проверяем наличие API ключей
-        if not user.api_key or not user.api_secret:
-            raise ValueError("API ключи не найдены")
-
-        # Возвращаем клиент и валютную пару пользователя
-        from mexc_sdk import Spot
-
-        return Spot(api_key=user.api_key, api_secret=user.api_secret), user.pair
-    except User.DoesNotExist:
-        raise ValueError("Пользователь не найден")
-    except Exception as e:
-        logger.error(
-            f"Ошибка при получении клиента для пользователя {telegram_id}: {e}"
-        )
-        raise ValueError(f"Ошибка: {e}")
+def get_user_client(telegram_id):
+    user = User.objects.get(telegram_id=telegram_id)
+    return client_for_user(user, allow_hold=True), user.pair
 
 
-def handle_mexc_response(response: dict, context: str = ""):
-    if (
-        isinstance(response, dict)
-        and response.get("code")
-        and response.get("code") != 200
-    ):
-        code = response.get("code")
-        msg = response.get("msg", "No message")
-        raise Exception(f"[MEXC ERROR] {context}: Code {code}, Message: {msg}")
+def handle_mexc_response(response, context=""):
+    if isinstance(response, dict) and response.get("code") not in (None, 0, 200):
+        raise RuntimeError(f"{context}: {response.get('code')} {response.get('msg')}")
     return response

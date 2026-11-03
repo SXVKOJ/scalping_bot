@@ -111,6 +111,9 @@ def _clean_pair(raw):
 
 
 PAIR = _clean_pair(os.getenv('PAIR'))
+EXCHANGE = os.getenv('EXCHANGE', 'bingx').strip().lower()
+if EXCHANGE not in ('bingx', 'mexc'):
+    raise ValueError('EXCHANGE must be bingx or mexc')
 TELEGRAM_PROXY = (os.getenv('TELEGRAM_PROXY') or os.getenv('HTTPS_PROXY') or os.getenv('HTTP_PROXY') or '').strip()
 NOTIFICATION_CHAT_ID = os.getenv('NOTIFICATION_CHAT_ID')
 NOTIFICATION_CHAT_IDS = os.getenv('NOTIFICATION_CHAT_IDS')

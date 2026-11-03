@@ -26,9 +26,9 @@ class Command(BaseCommand):
             pair = os.getenv("PAIR") or "не задана"
             BotMessageForStart.objects.create(
                 text=(
-                    f"Добро пожаловать в MexcBot.\n\n"
+                    f"Добро пожаловать в скальпинг-бот.\n\n"
                     f"Этот экземпляр торгует пару: <b>{pair}</b>\n\n"
-                    f"1. /set_keys — API-ключи MEXC\n"
+                    f"1. /set_keys — API-ключи биржи\n"
                     f"2. Дождитесь активации подписки в админке\n"
                     f"3. /parameters — профит, падение, пауза, сумма\n"
                     f"4. /autobuy — запуск автоторговли"

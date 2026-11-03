@@ -5,6 +5,7 @@ from aiogram.types import Message
 from bot.utils.user_autobuy_tasks import user_autobuy_tasks
 from bot.commands.autobuy import autobuy_loop
 from bot.logger import logger
+from django.conf import settings
 from bot.config import bot_instance
 
 # Create a fake message class to use when restarting autobuy
@@ -37,7 +38,7 @@ async def restart_autobuy_for_users(bot=None):
         logger.info("Starting to restart autobuy for users...")
         
         # Get all users with autobuy=True
-        autobuy_users = await sync_to_async(list)(User.objects.filter(autobuy=True))
+        autobuy_users = await sync_to_async(list)(User.objects.filter(autobuy=True, api_exchange=settings.EXCHANGE, execution_hold=""))
         
         if not autobuy_users:
             logger.info("No users with active autobuy found")
@@ -71,4 +72,4 @@ async def restart_autobuy_for_users(bot=None):
         logger.info("Finished restarting autobuy for users")
         
     except Exception as e:
-        logger.error(f"Error in restart_autobuy_for_users: {e}", exc_info=True) 
+        logger.error(f"Error in restart_autobuy_for_users: {e}", exc_info=True)

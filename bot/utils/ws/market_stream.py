@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 from bot.logger import logger
 from bot.utils.error_notifier import notify_component_error
+from bot.utils.ws.dispatcher import StreamDispatcher
 from bot.utils.ws.pb_decoder import decode_push_message
 
 
@@ -117,7 +118,22 @@ async def listen_market_messages_impl(manager: Any):
     manager.reconnect_delay = 1
     ping_task = asyncio.create_task(manager._ping_market_loop(ws))
 
+    # Развязка: цикл чтения только читает и разбирает протокол, а обработка
+    # сообщений (включая торговую логику) уходит в отдельный воркер.
+    # Порядок сообщений сохраняется — очередь строго FIFO, ни один тик не
+    # выбрасывается, поэтому логика анализа тренда не меняется.
+    async def _handle(data):
+        await handle_market_message_impl(manager, data)
+
     try:
+        # Запуск воркера — внутри try: если он не поднимется, мы обязаны
+        # залогировать ошибку и сбросить market_listener_active в finally,
+        # иначе слушатель тихо умирает, а флаг остаётся поднятым и
+        # переподключение больше не создаёт новый слушатель.
+        dispatcher = StreamDispatcher("MarketWS", _handle, maxsize=5000)
+        dispatcher.start()
+        manager.market_dispatcher = dispatcher
+
         while not manager.is_shutting_down and manager.market_connection and not ws.closed:
             try:
                 msg = await ws.receive(timeout=60)
@@ -183,7 +199,8 @@ async def listen_market_messages_impl(manager: Any):
                             pass
                         continue
 
-                    await handle_market_message_impl(manager, data)
+                    # Не блокируем чтение сокета: обработка уходит в воркер
+                    dispatcher.submit(data)
 
                 except json.JSONDecodeError as e:
                     logger.error(f"[MarketWS] JSON decode error: {e}")
@@ -198,7 +215,7 @@ async def listen_market_messages_impl(manager: Any):
                     if data is None:
                         logger.error("[MarketWS] Failed to decode protobuf binary market message")
                         continue
-                    await handle_market_message_impl(manager, data)
+                    dispatcher.submit(data)
                 except Exception as e:
                     logger.error(f"[MarketWS] Error processing binary message: {e}")
                     continue
@@ -233,6 +250,16 @@ async def listen_market_messages_impl(manager: Any):
                 await ping_task
             except asyncio.CancelledError:
                 pass
+
+        # Соединение оборвалось — недоработанные рыночные тики уже устарели,
+        # поэтому останавливаем воркер без дообработки очереди.
+        if 'dispatcher' in locals():
+            try:
+                dispatcher.shutdown(drain=False)
+            except Exception as e:
+                logger.error(f"[MarketWS] Ошибка остановки dispatcher: {e}")
+            if getattr(manager, 'market_dispatcher', None) is dispatcher:
+                manager.market_dispatcher = None
 
         manager.market_listener_active = False
         if hasattr(manager, '_market_listener_started'):

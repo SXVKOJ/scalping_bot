@@ -65,7 +65,7 @@ async def bot_start(message: Message):
 async def bot_help(message: Message):
     pair = settings.PAIR or "не задана"
     text = (
-        f"Скальпинг-бот MEXC. Пара этого экземпляра: <b>{pair}</b>\n\n"
+        f"Скальпинг-бот. Пара этого экземпляра: <b>{pair}</b>\n\n"
         f"/set_keys — привязать API-ключи биржи\n"
         f"/parameters — профит, падение, пауза, сумма покупки\n"
         f"/autobuy — включить автоторговлю\n"
