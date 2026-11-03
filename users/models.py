@@ -6,6 +6,8 @@ class User(models.Model):
     telegram_id = models.BigIntegerField(unique=True)
     api_key = models.CharField(max_length=255, unique=True, null=True, blank=True)
     api_secret = models.CharField(max_length=255, unique=True, null=True, blank=True)
+    api_exchange = models.CharField(max_length=16, default='mexc')
+    execution_hold = models.TextField(blank=True, default='')
     pair = models.CharField(max_length=30, null=True, blank=True, verbose_name='Торговая пара')
     created_at = models.DateTimeField(auto_now_add=True)
     profit = models.FloatField(null=True, blank=True)
@@ -36,6 +38,8 @@ class User(models.Model):
             self.save()
 
 class Deal(models.Model):
+    exchange = models.CharField(max_length=16, default='mexc', db_index=True)
+    migrated_from = models.OneToOneField('self', null=True, blank=True, on_delete=models.PROTECT, related_name='migrated_deal')
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     order_id = models.CharField(max_length=64, db_index=True)
     user_order_number = models.PositiveIntegerField(null=True, blank=True)
@@ -58,3 +62,15 @@ class Deal(models.Model):
 
     def __str__(self):
         return f"Order ID: {self.order_id}, Symbol: {self.symbol}, Buy Price: {self.buy_price}, Sell Price: {self.sell_price}, Quantity: {self.quantity}, Status: {self.status}"
+
+
+class OrderMigration(models.Model):
+    source = models.OneToOneField(Deal, on_delete=models.PROTECT)
+    client_order_id = models.CharField(max_length=40, unique=True)
+    symbol = models.CharField(max_length=20)
+    quantity = models.DecimalField(max_digits=20, decimal_places=8)
+    price = models.DecimalField(max_digits=20, decimal_places=8)
+    # PREPARED -> SUBMITTING -> COMPLETE; UNKNOWN requires reconciliation, not a second POST.
+    state = models.CharField(max_length=20, default='PREPARED')
+    order_id = models.CharField(max_length=64, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)

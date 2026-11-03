@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 from bot.logger import logger
 from bot.utils.error_notifier import notify_component_error
+from bot.utils.ws.dispatcher import StreamDispatcher
 from bot.utils.ws.pb_decoder import decode_push_message
 
 
@@ -21,8 +22,26 @@ async def listen_user_messages_impl(manager: Any, user_id: int):
     except Exception:
         pass
 
+    dispatcher = None
     try:
         from bot.utils.websocket_handlers import update_order_status
+
+        # Развязка: обновление статуса ордера ходит в БД и отправляет
+        # сообщения в Telegram. Раньше это выполнялось внутри цикла чтения,
+        # из-за чего задерживался ответ PONG на PING от MEXC (риск обрыва
+        # соединения) и следующие события по ордерам. Теперь читатель только
+        # читает, а обработка идёт в воркере строго в порядке поступления,
+        # поэтому последовательность статусов (NEW → FILLED) сохраняется.
+        async def _handle_order_event(event):
+            await update_order_status(
+                event["order_id"], event["symbol"], event["status"], user_id
+            )
+
+        dispatcher = StreamDispatcher(
+            f"UserWS:{user_id}", _handle_order_event, maxsize=2000
+        )
+        dispatcher.start()
+        manager.user_connections[user_id]["dispatcher"] = dispatcher
 
         while not manager.is_shutting_down and user_id in manager.user_connections:
             try:
@@ -141,10 +160,10 @@ async def listen_user_messages_impl(manager: Any, user_id: int):
                         f"Обновление ордера {order_id} для пользователя {user_id}: {symbol} - {status} (код: {status_code})"
                     )
 
-                    try:
-                        await update_order_status(order_id, symbol, status, user_id)
-                    except Exception as e:
-                        logger.error(f"Ошибка обновления статуса ордера: {e}")
+                    # Не блокируем чтение сокета: обработка уходит в воркер
+                    dispatcher.submit(
+                        {"order_id": order_id, "symbol": symbol, "status": status}
+                    )
 
                 elif channel == "spot@private.account.v3.api.pb":
                     manager.user_connections[user_id]["last_message_at"] = time.time()
@@ -191,10 +210,10 @@ async def listen_user_messages_impl(manager: Any, user_id: int):
                     logger.info(
                         f"Обновление ордера {order_id} для пользователя {user_id}: {symbol} - {status} (код: {status_code})"
                     )
-                    try:
-                        await update_order_status(order_id, symbol, status, user_id)
-                    except Exception as e:
-                        logger.error(f"Ошибка обновления статуса ордера: {e}")
+                    # Не блокируем чтение сокета: обработка уходит в воркер
+                    dispatcher.submit(
+                        {"order_id": order_id, "symbol": symbol, "status": status}
+                    )
 
                 elif channel == "spot@private.account.v3.api.pb":
                     manager.user_connections[user_id]["last_message_at"] = time.time()
@@ -257,5 +276,18 @@ async def listen_user_messages_impl(manager: Any, user_id: int):
                 await ping_task
             except asyncio.CancelledError:
                 pass
+
+        # События по ордерам терять нельзя — даём воркеру дообработать очередь.
+        if dispatcher is not None:
+            try:
+                dispatcher.shutdown(drain=True, timeout=5.0)
+            except Exception as e:
+                logger.error(
+                    f"[UserWS] Ошибка остановки dispatcher для {user_id}: {e}"
+                )
+            conn = manager.user_connections.get(user_id)
+            if conn is not None and conn.get("dispatcher") is dispatcher:
+                conn["dispatcher"] = None
+
         logger.info(f"User {user_id} WebSocket listener stopped")
         # Не инициируем реконнект тут, чтобы избежать дублей. Монитор сам восстановит соединение при необходимости.

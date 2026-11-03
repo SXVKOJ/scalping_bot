@@ -11,6 +11,11 @@ import django
 
 django.setup()
 
+from core.bootstrap import bootstrap_database
+
+# Also upgrades installations whose older Docker entrypoint does not run migrations.
+bootstrap_database()
+
 import asyncio
 from aiogram import Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -162,7 +167,12 @@ async def main():
             try:
                 # Закрываем все WebSocket соединения
                 logger.info("Closing all WebSocket connections...")
+                if 'rest_keepalive' in locals():
+                    rest_keepalive.cancel()
+                    await asyncio.gather(rest_keepalive, return_exceptions=True)
                 await websocket_manager.disconnect_all()
+                from bot.utils.exchange import close_shared_session
+                await close_shared_session()
 
                 # Логируем остановку бота
                 await log_to_db(

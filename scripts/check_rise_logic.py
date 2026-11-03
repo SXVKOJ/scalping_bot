@@ -45,6 +45,12 @@ mod("subscriptions", models=None)
 mod("subscriptions.models", Subscription=_Obj)
 mod("bot.utils.user_autobuy_tasks", user_autobuy_tasks={})
 mod("bot.utils.mexc", handle_mexc_response=lambda *a, **k: None)
+mod("bot.utils.exchange", ExchangeClient=object,
+    to_mexc_symbol=lambda pair: pair.replace('/', ''), split_pair=lambda pair: (pair[:-4], pair[-4:]),
+    client_for_user=lambda user: None, sell_terms=lambda *a: None,
+    require_user_exchange=lambda user: None, begin_trade=lambda *a, **k: None,
+    end_trade=lambda *a, **k: None, buy_fill=lambda *a: None,
+    place_entry=lambda *a, **k: None, EntryNotFilled=RuntimeError)
 mod("bot.utils.api_errors", parse_mexc_error=lambda e: str(e))
 mod("bot.utils.error_notifier", notify_user_autobuy_error=lambda *a, **k: None)
 

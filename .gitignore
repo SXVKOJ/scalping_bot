@@ -123,6 +123,10 @@ celerybeat.pid
 .env
 .env.pair2
 CREDENTIALS.txt
+/backups/
+/migration-private/
+orders-*.json
+mexc-history*.csv
 .venv
 env/
 venv/

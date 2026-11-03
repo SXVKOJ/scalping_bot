@@ -48,6 +48,8 @@ class MexcWebSocketManager:
         self.reconnecting_users = set()  # Set to track users currently in reconnection process
         self.market_connection_lock = asyncio.Lock()  # Блокировка для market connection
         self.market_listener_active = False  # Флаг активного listener
+        # Воркер обработки рыночных сообщений (развязан с циклом чтения сокета)
+        self.market_dispatcher = None
         # Трекер направления цены (рост/падение)
         self.direction_tracker = PriceDirectionTracker(max_history_size=100)
 
@@ -248,7 +250,7 @@ class MexcWebSocketManager:
 
             user = await User.objects.aget(telegram_id=user_id)
 
-            if not user.api_key or not user.api_secret:
+            if user.api_exchange != 'mexc' or not user.api_key or not user.api_secret:
                 logger.warning(f"User {user_id} missing API keys")
                 return False
 
@@ -644,7 +646,7 @@ class MexcWebSocketManager:
         from django.db.models import Q
 
         # Get all users with API keys
-        users = await sync_to_async(list)(User.objects.exclude(
+        users = await sync_to_async(list)(User.objects.filter(api_exchange='mexc').exclude(
             Q(api_key__isnull=True) |
             Q(api_key='') |
             Q(api_secret__isnull=True) |
@@ -803,6 +805,19 @@ class MexcWebSocketManager:
         stats['total_market_subscriptions'] = len(self.market_subscriptions)
         stats['total_bookticker_subscriptions'] = len(self.bookticker_subscriptions)
 
+        # Состояние воркеров обработки сообщений: глубина очереди и задержка
+        # показывают, успевает ли бот за потоком тиков.
+        if self.market_dispatcher is not None:
+            stats['market_dispatcher'] = self.market_dispatcher.stats()
+
+        user_dispatchers = {}
+        for uid, connection_data in self.user_connections.items():
+            dispatcher = connection_data.get('dispatcher')
+            if dispatcher is not None:
+                user_dispatchers[uid] = dispatcher.stats()
+        if user_dispatchers:
+            stats['user_dispatchers'] = user_dispatchers
+
         return stats
 
     async def force_cleanup_sessions(self):
@@ -915,4 +930,9 @@ class MexcWebSocketManager:
 
 
 # Create a singleton instance that will be imported and used throughout the application
-websocket_manager = MexcWebSocketManager()
+from django.conf import settings
+if settings.EXCHANGE == "bingx":
+    from bot.utils.bingx_ws import BingXWebSocketManager
+    websocket_manager = BingXWebSocketManager()
+else:
+    websocket_manager = MexcWebSocketManager()

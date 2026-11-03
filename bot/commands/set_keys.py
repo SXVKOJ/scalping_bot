@@ -4,6 +4,7 @@ from aiogram.fsm.context import FSMContext
 from asgiref.sync import sync_to_async
 from .states import APIAuth
 from users.models import User
+from django.conf import settings
 from bot.utils.mexc import check_mexc_keys_async
 from editing.models import BotMessagesForKeys
 import asyncio
@@ -20,7 +21,7 @@ def save_api_keys(user_id: int, api_key: str, api_secret: str):
     try:
         obj, _ = User.objects.update_or_create(
             telegram_id=user_id,
-            defaults={"api_key": api_key, "api_secret": api_secret}
+            defaults={"api_key": api_key, "api_secret": api_secret, "api_exchange": settings.EXCHANGE, "autobuy": False}
         )
         obj.set_default_parameters()
         obj.save()
@@ -64,7 +65,7 @@ async def cmd_set_keys(message: Message, state: FSMContext):
             
         else:
             # Стандартное сообщение, если нет в БД
-            response_text = "Отправьте ваш <b>API Key</b> от MEXC"
+            response_text = "Отправьте ваш <b>API Key</b> от BingX"
             await message.answer(response_text, parse_mode="HTML")
         
         # В любом случае переводим пользователя в состояние ожидания API Key
@@ -222,12 +223,12 @@ async def get_api_secret(message: Message, state: FSMContext):
                 await websocket_manager.disconnect_user(message.from_user.id)
                 
                 # Инициализируем WebSocket соединение для пользователя
-                await wait_msg.edit_text("⏳ Подключаемся к API MEXC...")
+                await wait_msg.edit_text("⏳ Подключаемся к API BingX...")
                 ws_success = await websocket_manager.connect_user_data_stream(message.from_user.id)
                 extra_data["websocket_connected"] = ws_success
                 
                 if ws_success:
-                    response_text = "✅ Ключи успешно сохранены и проверены.\nВаше соединение с MEXC установлено.\nДля запуска бота нажмите команду /autobuy"
+                    response_text = "✅ Ключи успешно сохранены и проверены.\nВаше соединение с BingX установлено.\nДля запуска бота нажмите команду /autobuy"
                     await message.answer(response_text)
                     extra_data["keys_saved"] = True
                 else:
@@ -235,7 +236,7 @@ async def get_api_secret(message: Message, state: FSMContext):
                     response_text = ("✅ Ключи успешно сохранены и проверены.\n"
                                     "⚠️ Однако не удалось установить WebSocket соединение. "
                                     "Это может быть связано с ограничениями API ключа.\n"
-                                    "Пожалуйста, проверьте настройки ваших API ключей на MEXC:\n"
+                                    "Пожалуйста, проверьте настройки ваших API ключей на BingX:\n"
                                     "1. Убедитесь, что IP ограничения настроены корректно\n"
                                     "2. Проверьте, что у ключа есть доступ к чтению данных аккаунта и торговле\n\n"
                                     "Некоторые функции могут быть недоступны.")
@@ -246,7 +247,7 @@ async def get_api_secret(message: Message, state: FSMContext):
                 # Ошибка при подключении WebSocket
                 logger.error(f"Ошибка при подключении к WebSocket: {ws_error}")
                 response_text = (f"✅ Ключи успешно сохранены, но не удалось подключиться к WebSocket API:\n{str(ws_error)}\n\n"
-                                f"Возможно, ключ имеет ограничения. Проверьте настройки API ключа на MEXC.")
+                                f"Возможно, ключ имеет ограничения. Проверьте настройки API ключа на BingX.")
                 await message.answer(response_text)
                 extra_data["keys_saved"] = True
                 extra_data["ws_error"] = str(ws_error)

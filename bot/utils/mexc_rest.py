@@ -32,7 +32,7 @@ async def get_shared_session() -> aiohttp.ClientSession:
                     keepalive_timeout=60,
                     enable_cleanup_closed=True,
                 )
-                _shared_session = aiohttp.ClientSession(connector=connector)
+                _shared_session = aiohttp.ClientSession(connector=connector, trust_env=True)
     return _shared_session
 
 
@@ -56,12 +56,15 @@ async def rest_keepalive_loop(interval_sec: int = 20) -> None:
     TCP+TLS handshake — десятки миллисекунд прямо в момент входа в сделку.
     """
     from bot.logger import logger
+    from django.conf import settings
 
     while True:
         try:
             session = await get_shared_session()
             async with session.get(
-                f"{MexcRestClient.BASE_URL}/api/v3/ping",
+                ("https://open-api.bingx.com/openApi/spot/v1/server/time"
+                 if settings.EXCHANGE == 'bingx'
+                 else f"{MexcRestClient.BASE_URL}/api/v3/ping"),
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 await resp.read()

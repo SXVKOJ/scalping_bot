@@ -4,7 +4,9 @@ import time
 from typing import Dict, Any, Optional
 from decimal import Decimal
 
-from logger import logger
+from bot.logger import logger
+from django.conf import settings
+from bot.utils.mexc_rest import split_pair
 
 from users.models import User, Deal
 from asgiref.sync import sync_to_async
@@ -59,9 +61,9 @@ async def update_order_status(order_id: str, symbol: str, status: str, user_id: 
         def get_and_update_deal():
             try:
                 if user_id is not None:
-                    deal = Deal.objects.get(order_id=order_id, user__telegram_id=user_id)
+                    deal = Deal.objects.get(exchange=settings.EXCHANGE, order_id=order_id, user__telegram_id=user_id)
                 else:
-                    deal = Deal.objects.get(order_id=order_id)
+                    deal = Deal.objects.get(exchange=settings.EXCHANGE, order_id=order_id)
                 old_status = deal.status
                 # Обновляем только если статус изменился
                 if old_status != status:
@@ -87,7 +89,7 @@ async def update_order_status(order_id: str, symbol: str, status: str, user_id: 
             # Если сделки нет в БД, но пришло активное состояние по WS — инициируем мягкий ресинк памяти из БД
             try:
                 from bot.commands.autobuy import autobuy_states
-                missing_deal = await sync_to_async(lambda: Deal.objects.filter(order_id=order_id, user__telegram_id=effective_user_id).first())()
+                missing_deal = await sync_to_async(lambda: Deal.objects.filter(exchange=settings.EXCHANGE, order_id=order_id, user__telegram_id=effective_user_id).first())()
                 if missing_deal and effective_user_id in autobuy_states:
                     active_orders = autobuy_states[effective_user_id].get('active_orders', [])
                     if not any(o.get('order_id') == order_id for o in active_orders):
@@ -112,14 +114,14 @@ async def update_order_status(order_id: str, symbol: str, status: str, user_id: 
                 buy_total = deal.quantity * deal.buy_price
                 sell_total = deal.quantity * deal.sell_price
                 profit = sell_total - buy_total
-                base = symbol[:3]
-                quote = symbol[3:]
+                base = split_pair(symbol)[0]
+                quote = split_pair(symbol)[1]
 
                 text = (
                     f"✅ *СДЕЛКА {deal.user_order_number} ЗАВЕРШЕНА*\n\n"
                     f"📦 Кол-во: `{deal.quantity:.6f}` {base}\n"
                     f"💰 Продано по: `{deal.sell_price:.6f}` {quote}\n"
-                    f"📊 Прибыль: `{profit:.4f}` {quote}"
+                    f"📊 Прибыль до комиссий: `{profit:.4f}` {quote}"
                 )
 
                 await send_message_safely(user.telegram_id, text, parse_mode='Markdown')
@@ -127,9 +129,9 @@ async def update_order_status(order_id: str, symbol: str, status: str, user_id: 
             elif status == "CANCELED":
                 text = (
                     f"❌ *СДЕЛКА {deal.user_order_number} ОТМЕНЕНА*\n\n"
-                    f"📦 Кол-во: `{deal.quantity:.6f}` {symbol[:3]}\n"
-                    f"💰 Куплено по: `{deal.buy_price:.6f}` {symbol[3:]}\n"
-                    f"📈 Продажа: `{deal.quantity:.4f}` {symbol[:3]} по {deal.sell_price:.6f} {symbol[3:]}\n"
+                    f"📦 Кол-во: `{deal.quantity:.6f}` {split_pair(symbol)[0]}\n"
+                    f"💰 Куплено по: `{deal.buy_price:.6f}` {split_pair(symbol)[1]}\n"
+                    f"📈 Продажа: `{deal.quantity:.4f}` {split_pair(symbol)[0]} по {deal.sell_price:.6f} {split_pair(symbol)[1]}\n"
                 )
 
                 await send_message_safely(user.telegram_id, text, parse_mode='Markdown')
@@ -234,7 +236,7 @@ async def handle_autobuy_order_update(order_id: str, symbol: str, status: str, u
     """Специальный обработчик для ордеров автобая"""
     try:
         # Получаем сделку
-        deal = await sync_to_async(lambda: Deal.objects.filter(order_id=order_id, is_autobuy=True).first())()
+        deal = await sync_to_async(lambda: Deal.objects.filter(exchange=settings.EXCHANGE, order_id=order_id, is_autobuy=True).first())()
 
         if deal:
             # Вызываем обработчик для обновления состояния автобая

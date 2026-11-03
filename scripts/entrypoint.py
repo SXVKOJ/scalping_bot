@@ -29,8 +29,7 @@ def main() -> None:
         sys.exit(1)
 
     wait_for_postgres()
-    subprocess.check_call([sys.executable, "manage.py", "migrate", "--noinput"])
-    subprocess.check_call([sys.executable, "manage.py", "ensure_defaults"])
+    subprocess.check_call([sys.executable, "scripts/bootstrap.py"])
     os.execvp(sys.argv[1], sys.argv[1:])
 
 

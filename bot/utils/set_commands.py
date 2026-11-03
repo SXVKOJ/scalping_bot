@@ -5,7 +5,7 @@ async def set_default_commands(bot: Bot):
     commands = [
         BotCommand(command="start", description="Старт"),
         BotCommand(command="help", description="Справка"),
-        BotCommand(command="set_keys", description="API-ключи MEXC"),
+        BotCommand(command="set_keys", description="API-ключи биржи"),
         BotCommand(command="autobuy", description="Автопокупка"),
         BotCommand(command="buy", description="Покупка"),
         BotCommand(command="status", description="Статус"),

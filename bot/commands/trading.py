@@ -12,7 +12,8 @@ from bot.logger import logger
 from bot.utils.error_notifier import notify_user_command_error
 from bot.keyboards.inline import get_period_keyboard, get_pagination_keyboard
 from asgiref.sync import sync_to_async
-from bot.utils.mexc_rest import MexcRestClient, split_pair, to_mexc_symbol
+from bot.utils.exchange import ExchangeClient as MexcRestClient, split_pair, to_mexc_symbol, client_for_user, sell_terms, begin_trade, end_trade, buy_fill, place_entry, EntryNotFilled
+from django.conf import settings
 from django.utils.timezone import localtime
 from bot.utils.mexc import handle_mexc_response
 from bot.utils.orders import execute_entry, place_take_profit
@@ -140,7 +141,7 @@ async def balance_handler(message: Message):
             await message.answer(response_text)
             raise ValueError("Missing API keys")
         symbol = to_mexc_symbol(pair)
-        rest = MexcRestClient(api_key=user.api_key, api_secret=user.api_secret)
+        rest = client_for_user(user, allow_hold=True)
 
         logger.info("/balance: fetching account_info...")
         account_info_task = asyncio.create_task(rest.account_info())
@@ -224,6 +225,8 @@ async def balance_handler(message: Message):
 # /buy
 @router.message(Command("buy"))
 async def buy_handler(message: Message):
+    if settings.EXCHANGE != "bingx":
+        return await _legacy_buy_handler(message)
     user_id = message.from_user.id
     username = (
         message.from_user.username or message.from_user.first_name or str(user_id)
@@ -232,6 +235,8 @@ async def buy_handler(message: Message):
     response_text = ""
     success = True
     extra_data = {"username": username, "chat_id": message.chat.id}
+    trade_intent = None
+    trade_complete = False
 
     try:
         user = await sync_to_async(User.objects.get)(telegram_id=message.from_user.id)
@@ -243,64 +248,92 @@ async def buy_handler(message: Message):
             return
 
         symbol = to_mexc_symbol(user.pair)
-        base_asset, quote_asset = split_pair(user.pair)
         extra_data["symbol"] = symbol
-        rest = MexcRestClient(api_key=user.api_key, api_secret=user.api_secret)
+        rest = client_for_user(user)
         buy_amount = float(user.buy_amount)
         extra_data["buy_amount"] = buy_amount
 
-        # 1-3. Покупка через общий модуль: точность цены/количества по
-        # правилам биржи, контроль проскальзывания, защита от дублей.
-        entry = await execute_entry(rest, symbol, buy_amount)
+        # 1. Создаём ордер
+        if settings.EXCHANGE == 'bingx':
+            book = await rest.book_ticker(symbol)
+            await rest.validate_buy_budget(symbol, buy_amount, book['askPrice'])
+        trade_intent = await begin_trade(user.pk, symbol)
+        buy_options = {"quoteOrderQty": buy_amount}
+        if trade_intent:
+            buy_options['newClientOrderId'] = trade_intent['buy_id']
+        buy_order = await place_entry(rest, symbol, buy_amount, buy_options, book['askPrice'])
+        handle_mexc_response(buy_order, "Покупка через /buy")
 
-        order_id = entry.order_id
+        order_id = buy_order["orderId"]
         extra_data["buy_order_id"] = order_id
 
-        if not entry.filled:
-            response_text = "❗ Ордер не исполнился (executedQty=0)."
-            success = False
-            await message.answer(response_text)
-            return
+        # 2. Подтягиваем детали через query_order
+        order_info = await buy_fill(rest, symbol, order_id)
+        logger.info(f"Детали ордера {order_id}: {order_info}")
 
-        executed_qty = entry.executed_qty
-        spent = entry.spent
-        real_price = entry.avg_price
+        # 3. Получаем количество и среднюю цену
+        executed_qty = float(order_info.get("executedQty", 0))
+        if executed_qty == 0:
+            if order_info.get('status') in ('CANCELED', 'FAILED'):
+                raise EntryNotFilled('BUY ended without a fill; signal skipped')
+            raise ValueError("BUY fill requires reconciliation (executedQty=0)")
+
+        spent = float(order_info["cummulativeQuoteQty"])
+        if spent == 0:
+            raise ValueError("BUY amount requires reconciliation (spent=0)")
+
+        real_price = spent / executed_qty if executed_qty > 0 else 0
         extra_data["real_price"] = real_price
         extra_data["executed_qty"] = executed_qty
         extra_data["spent"] = spent
 
-        # 4-5. Лимит на продажу
+        # 4. Считаем цену продажи
         profit_percent = float(user.profit)
-        take_profit = await place_take_profit(
-            rest, symbol, executed_qty, real_price, profit_percent
-        )
-        sell_order_id = take_profit["order_id"]
-        sell_price = take_profit["price"]
-        sell_qty = take_profit["quantity"]
-        extra_data["sell_order_id"] = sell_order_id
+        net_qty, target_price = await sell_terms(rest, symbol, order_info, profit_percent)
+        executed_qty = float(net_qty)
+        sell_price = float(target_price)
         extra_data["sell_price"] = sell_price
         extra_data["profit_percent"] = profit_percent
+
+        # 5. Выставляем лимитный SELL ордер
+        sell_order = await rest.new_order(
+            symbol,
+            "SELL",
+            "LIMIT",
+            {
+                "quantity": str(net_qty),
+                "price": str(target_price),
+                "timeInForce": "GTC",
+                **({'newClientOrderId': trade_intent['sell_id']} if trade_intent else {}),
+            },
+        )
+        handle_mexc_response(sell_order, "Продажа")
+        sell_order_id = sell_order["orderId"]
+        extra_data["sell_order_id"] = sell_order_id
         logger.info(
-            f"SELL ордер {sell_order_id} выставлен на {sell_price} {quote_asset}"
+            f"SELL ордер {sell_order_id} выставлен на {sell_price:.6f} {split_pair(symbol)[1]}"
         )
 
         # 6. Сохраняем ордер в базу
         # Получаем следующий номер
         last_number = await sync_to_async(
-            lambda: Deal.objects.filter(user=user).count()
+            lambda: Deal.objects.filter(exchange=settings.EXCHANGE, user=user).count()
         )()
         user_order_number = last_number + 1
         extra_data["user_order_number"] = user_order_number
         deal = await sync_to_async(Deal.objects.create)(
+            exchange=settings.EXCHANGE,
             user=user,
             order_id=sell_order_id,
             user_order_number=user_order_number,
             symbol=symbol,
             buy_price=real_price,
-            quantity=sell_qty,
+            quantity=executed_qty,
             sell_price=sell_price,
             status="NEW",
         )
+        trade_complete = True
+        await end_trade(user.pk, trade_intent)
 
         # 6.1 Уточняем начальный статус через REST сразу после создания SELL
         try:
@@ -317,10 +350,10 @@ async def buy_handler(message: Message):
         # 7. Отправляем ответ
         response_text = (
             f"🟢 *СДЕЛКА {user_order_number} ОТКРЫТА*\n\n"
-            f"📉 Куплено по: `{real_price:.6f}` {quote_asset}\n"
-            f"📦 Кол-во: `{executed_qty:.6f}` {base_asset}\n"
-            f"💸 Потрачено: `{spent:.2f}` {quote_asset}\n\n"
-            f"📈 Лимит на продажу: `{sell_price}` {quote_asset}"
+            f"📉 Куплено по: `{real_price:.6f}` {split_pair(symbol)[1]}\n"
+            f"📦 Кол-во: `{executed_qty:.6f}` {split_pair(symbol)[0]}\n"
+            f"💸 Потрачено: `{spent:.2f}` {split_pair(symbol)[1]}\n\n"
+            f"📈 Лимит на продажу: `{sell_price:.6f}` {split_pair(symbol)[1]}"
         )
         await message.answer(response_text, parse_mode="Markdown")
 
@@ -331,8 +364,23 @@ async def buy_handler(message: Message):
         # 8. Не запускаем мониторинг - WebSocket будет отслеживать изменения
         # Статус будет обновляться автоматически через WebSocket
 
+    except EntryNotFilled:
+        await end_trade(user.pk, trade_intent)
+        response_text = 'ℹ️ Лимитный вход не исполнился. Сигнал пропущен.'
+        await message.answer(response_text)
+    except asyncio.CancelledError:
+        if 'user' in locals():
+            await asyncio.shield(end_trade(user.pk, trade_intent, 'Operation interrupted; reconcile before restarting'))
+        raise
     except Exception as e:
         logger.exception("Ошибка при выполнении /buy", extra={"user_id": user_id})
+        from bot.utils.bingx_rest import OrderOutcomeUnknown
+        if "user" in locals():
+            uncertain = not trade_complete and not isinstance(e, EntryNotFilled) and ("buy_order" in locals() or isinstance(e, OrderOutcomeUnknown))
+            await end_trade(user.pk, trade_intent, str(e) if uncertain else None)
+            if uncertain and not trade_intent:
+                await sync_to_async(User.objects.filter(pk=user.pk).update)(
+                    autobuy=False, execution_hold=f"Manual BUY/SELL requires reconciliation: {e}")
         response_text = f"❌ {parse_mexc_error(e)}"
         success = False
         await message.answer(response_text)
@@ -364,11 +412,16 @@ async def autobuy_handler(message: Message):
         user = await sync_to_async(User.objects.get)(telegram_id=telegram_id)
         extra_data["pair"] = user.pair
 
+        from bot.utils.exchange import require_user_exchange
+        require_user_exchange(user)
         if user.autobuy:
             response_text = "⚠️ Автобай уже запущен. Остановить: /stop"
             await message.answer(response_text)
             return
 
+        if await sync_to_async(Deal.objects.filter(user=user, exchange="mexc", status__in=["NEW", "PARTIALLY_FILLED", "SKIPPED"], migrated_deal__isnull=True).exists)() and settings.EXCHANGE == "bingx":
+            await message.answer("Перед запуском сверьте остатки и восстановите старые продажи MEXC на BingX.")
+            return
         user.autobuy = True
         await sync_to_async(user.save)(update_fields=["autobuy"])
 
@@ -410,6 +463,9 @@ async def stop_autobuy(message: Message):
 
     try:
         telegram_id = message.from_user.id
+        from bot.commands.autobuy import autobuy_states
+        if telegram_id in autobuy_states:
+            autobuy_states[telegram_id]["autobuy_active"] = False
 
         # Сбрасываем флаг в памяти ПЕРВЫМ делом: обработчик тиков и
         # process_buy сверяются именно с ним, чтобы не ходить в БД на
@@ -519,7 +575,7 @@ async def status_pagination_handler(callback: CallbackQuery):
 
         # Получаем активные ордера из базы (без обновления статусов)
         active_deals = await sync_to_async(list)(
-            Deal.objects.filter(
+            Deal.objects.filter(exchange=settings.EXCHANGE,
                 user=user, status__in=["PARTIALLY_FILLED", "NEW"]
             ).order_by("-created_at")
         )
@@ -554,9 +610,9 @@ async def status_pagination_handler(callback: CallbackQuery):
 
                     formatted = (
                         f"\n\n<u>{deal.user_order_number}. Ордер на продажу{autobuy_note}</u>\n\n"
-                        f"<b>{deal.quantity:.6f} {symbol[:3]}</b>\n"
-                        f"- Куплено по <b>{deal.buy_price:.6f}</b> (<b>{deal.buy_price * deal.quantity:.2f}</b> {symbol[3:]})\n"
-                        f"- Продается по <b>{deal.sell_price:.6f}</b> (<b>{deal.sell_price * deal.quantity:.2f}</b> {symbol[3:]})\n\n"
+                        f"<b>{deal.quantity:.6f} {split_pair(symbol)[0]}</b>\n"
+                        f"- Куплено по <b>{deal.buy_price:.6f}</b> (<b>{deal.buy_price * deal.quantity:.2f}</b> {split_pair(symbol)[1]})\n"
+                        f"- Продается по <b>{deal.sell_price:.6f}</b> (<b>{deal.sell_price * deal.quantity:.2f}</b> {split_pair(symbol)[1]})\n\n"
                         f"<i>{date_str}</i>"
                     )
 
@@ -625,7 +681,7 @@ async def show_status_page(message, user_id, page=1, check_status=True):
                 symbol = None
                 try:
                     symbol = (user.pair or "").replace("/", "")
-                    rest_client = MexcRestClient(user.api_key, user.api_secret)
+                    rest_client = client_for_user(user, allow_hold=True)
                 except Exception as e:
                     logger.error(f"Ошибка при создании REST клиента: {e}")
 
@@ -633,7 +689,7 @@ async def show_status_page(message, user_id, page=1, check_status=True):
                 if rest_client and symbol:
                     # Получаем все ордера пользователя из базы
                     user_deals = await sync_to_async(list)(
-                        Deal.objects.filter(user=user)
+                        Deal.objects.filter(exchange=settings.EXCHANGE, user=user)
                     )
 
                     # Создаем словарь для быстрого поиска ордеров по ID
@@ -678,16 +734,16 @@ async def show_status_page(message, user_id, page=1, check_status=True):
                                     api_status = None
 
                                 # Если ордер не найден или завершен, отмечаем как SKIPPED
-                                if not api_status or api_status not in [
+                                if api_status and api_status not in [
                                     "NEW",
                                     "PARTIALLY_FILLED",
                                 ]:
-                                    deal.status = "SKIPPED"
+                                    deal.status = api_status
                                     await sync_to_async(deal.save)()
                                     logger.info(
                                         f"Ордер {deal_id} помечен как SKIPPED (не найден в API)"
                                     )
-                                else:
+                                elif api_status:
                                     # Обновляем статус из API
                                     deal.status = api_status
                                     await sync_to_async(deal.save)()
@@ -719,7 +775,7 @@ async def show_status_page(message, user_id, page=1, check_status=True):
 
                 # После всех проверок через API получаем активные ордера из базы
                 active_deals = await sync_to_async(list)(
-                    Deal.objects.filter(
+                    Deal.objects.filter(exchange=settings.EXCHANGE,
                         user=user, status__in=["PARTIALLY_FILLED", "NEW"]
                     ).order_by("-created_at")
                 )
@@ -728,14 +784,14 @@ async def show_status_page(message, user_id, page=1, check_status=True):
                 logger.error(f"Ошибка при обновлении статусов: {e}")
                 # Продолжаем с данными из базы
                 active_deals = await sync_to_async(list)(
-                    Deal.objects.filter(
+                    Deal.objects.filter(exchange=settings.EXCHANGE,
                         user=user, status__in=["PARTIALLY_FILLED", "NEW"]
                     ).order_by("-created_at")
                 )
         else:
             # Если не обновляем статусы, просто получаем активные ордера из базы
             active_deals = await sync_to_async(list)(
-                Deal.objects.filter(
+                Deal.objects.filter(exchange=settings.EXCHANGE,
                     user=user, status__in=["PARTIALLY_FILLED", "NEW"]
                 ).order_by("-created_at")
             )
@@ -770,9 +826,9 @@ async def show_status_page(message, user_id, page=1, check_status=True):
 
                     formatted = (
                         f"\n\n<u>{deal.user_order_number}. Ордер на продажу{autobuy_note}</u>\n\n"
-                        f"<b>{deal.quantity:.6f} {symbol[:3]}</b>\n"
-                        f"- Куплено по <b>{deal.buy_price:.6f}</b> (<b>{deal.buy_price * deal.quantity:.2f}</b> {symbol[3:]})\n"
-                        f"- Продается по <b>{deal.sell_price:.6f}</b> (<b>{deal.sell_price * deal.quantity:.2f}</b> {symbol[3:]})\n\n"
+                        f"<b>{deal.quantity:.6f} {split_pair(symbol)[0]}</b>\n"
+                        f"- Куплено по <b>{deal.buy_price:.6f}</b> (<b>{deal.buy_price * deal.quantity:.2f}</b> {split_pair(symbol)[1]})\n"
+                        f"- Продается по <b>{deal.sell_price:.6f}</b> (<b>{deal.sell_price * deal.quantity:.2f}</b> {split_pair(symbol)[1]})\n\n"
                         f"<i>{date_str}</i>"
                     )
 
@@ -879,3 +935,127 @@ async def ask_stats_period(message: Message):
 @router.callback_query(F.data == "dummy_callback")
 async def dummy_callback_handler(callback: CallbackQuery):
     await callback.answer("Действие недоступно")
+
+
+async def _legacy_buy_handler(message: Message):
+    user_id = message.from_user.id
+    username = (
+        message.from_user.username or message.from_user.first_name or str(user_id)
+    )
+    command = "/buy"
+    response_text = ""
+    success = True
+    extra_data = {"username": username, "chat_id": message.chat.id}
+
+    try:
+        user = await sync_to_async(User.objects.get)(telegram_id=message.from_user.id)
+
+        if not user.pair:
+            response_text = "❗ Вы не выбрали торговую пару. Введите /pair для выбора."
+            success = False
+            await message.answer(response_text)
+            return
+
+        symbol = to_mexc_symbol(user.pair)
+        base_asset, quote_asset = split_pair(user.pair)
+        extra_data["symbol"] = symbol
+        rest = client_for_user(user)
+        buy_amount = float(user.buy_amount)
+        extra_data["buy_amount"] = buy_amount
+
+        # 1-3. Покупка через общий модуль: точность цены/количества по
+        # правилам биржи, контроль проскальзывания, защита от дублей.
+        entry = await execute_entry(rest, symbol, buy_amount)
+
+        order_id = entry.order_id
+        extra_data["buy_order_id"] = order_id
+
+        if not entry.filled:
+            response_text = "❗ Ордер не исполнился (executedQty=0)."
+            success = False
+            await message.answer(response_text)
+            return
+
+        executed_qty = entry.executed_qty
+        spent = entry.spent
+        real_price = entry.avg_price
+        extra_data["real_price"] = real_price
+        extra_data["executed_qty"] = executed_qty
+        extra_data["spent"] = spent
+
+        # 4-5. Лимит на продажу
+        profit_percent = float(user.profit)
+        take_profit = await place_take_profit(
+            rest, symbol, executed_qty, real_price, profit_percent
+        )
+        sell_order_id = take_profit["order_id"]
+        sell_price = take_profit["price"]
+        sell_qty = take_profit["quantity"]
+        extra_data["sell_order_id"] = sell_order_id
+        extra_data["sell_price"] = sell_price
+        extra_data["profit_percent"] = profit_percent
+        logger.info(
+            f"SELL ордер {sell_order_id} выставлен на {sell_price} {quote_asset}"
+        )
+
+        # 6. Сохраняем ордер в базу
+        # Получаем следующий номер
+        last_number = await sync_to_async(
+            lambda: Deal.objects.filter(user=user).count()
+        )()
+        user_order_number = last_number + 1
+        extra_data["user_order_number"] = user_order_number
+        deal = await sync_to_async(Deal.objects.create)(
+            user=user,
+            order_id=sell_order_id,
+            user_order_number=user_order_number,
+            symbol=symbol,
+            buy_price=real_price,
+            quantity=sell_qty,
+            sell_price=sell_price,
+            status="NEW",
+        )
+
+        # 6.1 Уточняем начальный статус через REST сразу после создания SELL
+        try:
+            order_check = await rest.query_order(symbol, {"orderId": sell_order_id})
+            current_status = order_check.get("status")
+            if current_status and current_status != deal.status:
+                deal.status = current_status
+                await sync_to_async(deal.save)()
+        except Exception as e:
+            logger.warning(
+                f"Не удалось уточнить начальный статус ордера {sell_order_id}: {e}"
+            )
+
+        # 7. Отправляем ответ
+        response_text = (
+            f"🟢 *СДЕЛКА {user_order_number} ОТКРЫТА*\n\n"
+            f"📉 Куплено по: `{real_price:.6f}` {quote_asset}\n"
+            f"📦 Кол-во: `{executed_qty:.6f}` {base_asset}\n"
+            f"💸 Потрачено: `{spent:.2f}` {quote_asset}\n\n"
+            f"📈 Лимит на продажу: `{sell_price}` {quote_asset}"
+        )
+        await message.answer(response_text, parse_mode="Markdown")
+
+        logger.info(
+            f"BUY + SELL for {user.telegram_id}: {executed_qty} {symbol} @ {real_price} -> {sell_price}"
+        )
+
+        # 8. Не запускаем мониторинг - WebSocket будет отслеживать изменения
+        # Статус будет обновляться автоматически через WebSocket
+
+    except Exception as e:
+        logger.exception("Ошибка при выполнении /buy", extra={"user_id": user_id})
+        response_text = f"❌ {parse_mexc_error(e)}"
+        success = False
+        await message.answer(response_text)
+
+    # Логируем команду и ответ
+    await log_command(
+        user_id=user_id,
+        command=command,
+        response=response_text,
+        success=success,
+        extra_data=extra_data,
+    )

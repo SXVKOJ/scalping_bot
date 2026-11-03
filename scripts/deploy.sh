@@ -310,7 +310,7 @@ wait_http() {
 clear 2>/dev/null || true
 cat >/dev/tty <<'EOF'
 ============================================================
-  Установка торговых Telegram-ботов (MEXC)
+  Установка торговых Telegram-ботов (BingX Spot)
 ============================================================
 
 Скрипт сам:
@@ -341,7 +341,7 @@ done
 
 log "Шаг 3/5. Связь с Telegram"
 echo "Если этот сервер в России, Telegram почти всегда нужен прокси (SOCKS5 или HTTP в Европе)." >/dev/tty
-echo "Биржа MEXC при этом продолжит работать с IP этого сервера." >/dev/tty
+echo "Проверьте фактический исходящий IP для BingX и внесите его в whitelist API." >/dev/tty
 echo "Пример: socks5://login:password@10.0.0.1:1080" >/dev/tty
 PROXY=""
 if [[ "$(ask_yes_no "Нужен прокси для Telegram?" "n")" == "y" ]]; then
@@ -390,7 +390,7 @@ UNAME1="" UNAME2=""
 NAME1="" NAME2=""
 
 log "Настройка бота №1"
-PAIR1="$(ask "Торговая пара первого бота (как на MEXC)" "BTC/USDT")"
+PAIR1="$(ask "Торговая пара первого бота (как на BingX)" "BTC/USDT")"
 info1="$(ask_token "бота №1" "$PROXY" "")"
 TOKEN1="${info1%%|||*}"
 rest="${info1#*|||}"
@@ -420,6 +420,8 @@ SECRET2="$(random_secret)"
 log "Сохраняю настройки"
 write_env "$ROOT/.env" \
   "PAIR=${PAIR1}" \
+  "EXCHANGE=bingx" \
+  "BINGX_ORDER_INTERVAL=0.25" \
   "TELEGRAM_TOKEN=${TOKEN1}" \
   "TELEGRAM_PROXY=${PROXY}" \
   "NOTIFICATION_CHAT_ID=" \
@@ -441,6 +443,8 @@ write_env "$ROOT/.env" \
 if [[ "$BOTS_COUNT" == "2" ]]; then
   write_env "$ROOT/.env.pair2" \
     "PAIR=${PAIR2}" \
+    "EXCHANGE=bingx" \
+    "BINGX_ORDER_INTERVAL=0.25" \
     "TELEGRAM_TOKEN=${TOKEN2}" \
     "TELEGRAM_PROXY=${PROXY}" \
     "NOTIFICATION_CHAT_ID=" \
@@ -501,9 +505,9 @@ fi
   echo "Пароль базы:      $PG_PASS"
   echo
   echo "Что сделать дальше:"
-  echo "1) Откройте бота в Telegram → /start → /set_keys (ключи MEXC)."
+  echo "1) Откройте бота в Telegram → /start → /set_keys (ключи BingX)."
   echo "2) В админке: Subscriptions → добавьте подписку этому пользователю."
-  echo "3) В API-ключе MEXC в белый список IP добавьте: $IP"
+  echo "3) В API-ключе BingX в белый список добавьте фактический исходящий IP сервера."
   echo "4) /parameters и /autobuy"
   echo "========================================"
 } | tee "$ROOT/CREDENTIALS.txt"

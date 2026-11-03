@@ -6,8 +6,9 @@ from bot.commands.states import APIAuth
 from django.core.exceptions import ObjectDoesNotExist
 from aiogram.fsm.context import FSMContext
 from bot.logger import logger
+from django.conf import settings
 
-ALLOWED_COMMANDS = ["/set_keys", "/start", "/help", "/ping"]
+ALLOWED_COMMANDS = ["/set_keys", "/start", "/help", "/ping", "/stop"]
 
 
 class AuthMiddleware(BaseMiddleware):
@@ -27,7 +28,7 @@ class AuthMiddleware(BaseMiddleware):
             current_state = None
         telegram_id = message.from_user.id
 
-        logger.info(f"Received message from {telegram_id}: {message.text}")
+        logger.info(f"Received message from {telegram_id}")
         logger.info(f"Current state: {current_state}")
 
         # Не текст? — уведомим
@@ -54,7 +55,7 @@ class AuthMiddleware(BaseMiddleware):
             return
 
         try:
-            if not user.api_key or not user.api_secret:
+            if not user.api_key or not user.api_secret or user.api_exchange != settings.EXCHANGE:
                 logger.warning(f"User {telegram_id} has no API keys.")
                 await message.answer("Пожалуйста, сначала введите API ключи через /set_keys.")
                 return

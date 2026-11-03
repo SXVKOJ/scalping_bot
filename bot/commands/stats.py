@@ -1,6 +1,8 @@
 import pytz
 from django.utils import timezone
 from users.models import Deal
+from django.conf import settings
+from bot.utils.mexc_rest import split_pair
 from datetime import timedelta
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
@@ -106,7 +108,7 @@ async def handle_stats_callback(callback_query: CallbackQuery):
             stats_message = (
                 f"<b>{period_label}</b>\n\n"
                 f"Количество сделок: {len(deals)}\n"
-                f"Прибыль: {profit_total:.4f} {pair[3:]}\n"
+                f"Расчётная прибыль до комиссий: {profit_total:.4f} {split_pair(pair)[1]}\n"
                 f"Средний % профита: {avg_profit_percent:.2f}%"
             )
 
@@ -134,6 +136,7 @@ async def handle_stats_callback(callback_query: CallbackQuery):
 def get_user_and_deals(telegram_id, start_date, end_date):
     user = User.objects.get(telegram_id=telegram_id)
     deals = Deal.objects.filter(
+        exchange=settings.EXCHANGE,
         user=user,
         updated_at__range=[start_date, end_date],
         sell_price__isnull=False,

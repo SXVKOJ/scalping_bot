@@ -10,7 +10,7 @@ from django.db.utils import OperationalError
 from bot.constants import DEFAULT_PAYMENT_MESSAGE, PAIR
 from aiogram.types import FSInputFile
 
-ALLOWED_COMMANDS = {"/start", "/help", "/ping", "/set_keys"}
+ALLOWED_COMMANDS = {"/start", "/help", "/ping", "/set_keys", "/stop"}
 
 
 class AccessMiddleware(BaseMiddleware):
